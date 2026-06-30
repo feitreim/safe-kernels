@@ -1,0 +1,14 @@
+# Rust build output (kernels build remotely on Modal, but cargo may run locally too)
+target/
+**/target/
+Cargo.lock
+
+# cuda-oxide generated artifacts
+*.ptx
+*.ll
+*.ltoir
+*.cubin
+
+# misc
+.DS_Store
+__pycache__/
