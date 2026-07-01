@@ -1,15 +1,14 @@
-//! The `#[kernel]` function inside `#[cuda_module]` is compiled to PTX by the
+//! The `#[kernel]` functions inside `#[cuda_module]` are compiled to PTX by the
 //! cuda-oxide codegen backend and written to `vecsum.ptx` next to this crate.
 //! Shared by `main.rs` (correctness check) and `src/bin/bench.rs` (throughput
-//! benchmark) so the kernel is defined exactly once.
+//! benchmark) so each kernel is defined once.
 //!
 //! Each binary loads the PTX file directly (`ctx.load_module_from_file` +
-//! `kernels::from_module`) rather than `kernels::load`, which only looks for
-//! a PTX artifact embedded in the *currently running executable*. Since the
-//! kernel now lives in this lib crate rather than directly in a `main.rs`,
-//! the linker drops that embedded artifact as dead weight from `main`/`bench`
-//! (nothing in their compiled code references it) — `kernels::load` would
-//! fail with `ModuleNotFound`. Loading from the file side-steps that.
+//! `kernels::from_module`) rather than `kernels::load`, which only looks for a
+//! PTX artifact embedded under this crate's name in the running executable — and
+//! the linker drops that as dead weight from `main`/`bench` (nothing in their
+//! compiled code references it), so `load` fails with `ModuleNotFound`. Loading
+//! from the file side-steps that.
 
 use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
@@ -20,6 +19,7 @@ pub mod kernels {
     use cuda_device::{SharedArray, atomic::DeviceAtomicF32, launch_bounds, sync_threads, warp};
 
     pub const M: usize = 256;
+    pub const N: usize = 1 << 24; // elements to reduce (16M)
     static mut TILE: SharedArray<f32, M> = SharedArray::UNINIT;
 
     fn warp_reduce(mut val: f32) -> f32 {
@@ -34,6 +34,51 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(256)]
     pub fn vecsum(a: &[f32], mut out: DisjointSlice<f32>) {
+        //vecsum grid-stride reduction
+        // we first load from global memory in chunks, thats why stride is the #
+        // of total threads
+        let idx = thread::index_1d();
+        let tid = thread::threadIdx_x() as usize;
+        let stride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
+
+        let mut pre = 0.0f32;
+        let mut i = idx.get();
+        while i < N {
+            pre += a[i];
+            i += stride;
+        }
+
+        unsafe {
+            TILE[tid] = pre;
+        }
+        sync_threads();
+
+        let mut s = thread::blockDim_x() as usize / 2;
+        while s > 16 {
+            if tid < s {
+                unsafe { TILE[tid] += TILE[tid + s] }
+            }
+            sync_threads();
+            s >>= 1;
+        }
+
+        // Unroll the last loop iterations once they can be handled by a single
+        // warp. warps are SIMT syncronized, so they dont need additional barriers.
+        let mut val = unsafe { TILE[tid] };
+        if tid < 32 {
+            val = warp_reduce(val);
+        }
+
+        if tid == 0 {
+            let res = unsafe { &*(out.as_mut_ptr() as *const DeviceAtomicF32) };
+            res.fetch_add(val, cuda_device::atomic::AtomicOrdering::Relaxed);
+        }
+    }
+
+
+    #[kernel]
+    #[launch_bounds(256)]
+    pub fn vecsum_warp_unroll(a: &[f32], mut out: DisjointSlice<f32>) {
         //vecsum warp reduce
         let idx = thread::index_1d();
         let tid = thread::threadIdx_x() as usize;
@@ -168,29 +213,26 @@ pub mod kernels {
 }
 
 // ---------------------------------------------------------------------------
-// Host-side recursive reduction driver.
+// Host-side reduction driver.
 //
-// A single `vecsum` launch is only a *partial* reduction: each block collapses
-// its `M`-element tile to one value, so `k` inputs become `ceil(k / M)` partial
-// sums (one per block). To get a single scalar we launch again over those
-// partials, and again, until one value remains — a tree of launches whose depth
-// is `ceil(log_M(N))` (3 launches for N = 16M with M = 256).
-//
-// The kernel reads a full `M`-wide tile per block with no bounds check, so every
-// buffer it consumes must be zero-padded up to a multiple of `M`. We get that
-// for free: each pass's output buffer is `zeroed` at the padded size and the
-// kernel writes only the live `blocks` prefix, leaving the tail zero for the
-// next pass to read. Zero is the additive identity, so the padding never changes
-// the sum.
+// `vecsum` is a single-launch grid-stride reduction: a fixed grid of `GRID`
+// blocks strides over all `N` inputs (a compile-time const in the kernel), each
+// block reduces its share to one value, and each block's thread 0 atomic-adds
+// that partial into the lone output accumulator. One launch — no recursive tree,
+// and since the kernel bounds its reads with `i < N` there is nothing to
+// zero-pad. `out` must start at zero because every block accumulates into it;
+// the atomic adds land in unspecified order, so the result is not bit-
+// reproducible run to run.
 use kernels::{LoadedModule, M};
 
-fn round_up(n: usize, m: usize) -> usize {
-    n.div_ceil(m) * m
-}
+/// Grid width: how many blocks stride over the input. Sized to roughly fill an
+/// H100 — ~full occupancy at 256 threads/block — and the main knob to sweep for
+/// the streaming pass.
+pub const GRID: usize = 1024;
 
-/// Launch geometry for one reduction pass: `blocks` blocks of `M` threads each,
-/// matching the kernel's `TILE` length and `#[launch_bounds(256)]`.
-fn pass_config(blocks: usize) -> LaunchConfig {
+/// Launch geometry: `blocks` blocks of `M` threads, matching the kernel's `TILE`
+/// length and `#[launch_bounds(256)]`.
+fn launch(blocks: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (blocks as u32, 1, 1),
         block_dim: (M as u32, 1, 1),
@@ -198,34 +240,26 @@ fn pass_config(blocks: usize) -> LaunchConfig {
     }
 }
 
-/// Recursively reduce `a` to a single `f32` by launching `vecsum` until one
-/// value remains. `a`'s length must already be a multiple of `M` (as allocated
-/// by the callers); every intermediate buffer is padded to a multiple of `M`
-/// internally. Allocates a fresh output buffer per pass — fine for correctness
-/// runs; the benchmark pre-allocates instead to keep allocation out of its timed
-/// region.
+/// Reduce the `kernels::N` elements of `a` to a single `f32` in one grid-stride
+/// launch. `out` starts zeroed because the kernel accumulates into it with
+/// atomic adds.
 pub fn reduce(
     stream: &CudaStream,
     module: &LoadedModule,
     a: &DeviceBuffer<f32>,
 ) -> Result<f32, DriverError> {
-    let mut blocks = a.len().div_ceil(M);
-    let mut buf = DeviceBuffer::<f32>::zeroed(stream, round_up(blocks, M))?;
-    module.vecsum(stream, pass_config(blocks), a, &mut buf)?;
-
-    while blocks > 1 {
-        blocks = blocks.div_ceil(M);
-        let mut next = DeviceBuffer::<f32>::zeroed(stream, round_up(blocks, M))?;
-        module.vecsum(stream, pass_config(blocks), &buf, &mut next)?;
-        buf = next;
-    }
-
-    Ok(buf.to_host_vec(stream)?[0])
+    let mut out = DeviceBuffer::<f32>::zeroed(stream, 1)?;
+    module.vecsum(stream, launch(GRID), a, &mut out)?;
+    Ok(out.to_host_vec(stream)?[0])
 }
+
+// BASELINE
+// cub::DeviceReduce  avg=0.0274 ms  throughput=2452.9 GB/s
 
 // BENCHMARKS:
 // -- GPU: H100                 avg time    throughput
-// WARP REDUCE:                 0.0676 ms   1000.3 GB/s
+// GRID-STRIDE:                 0.0334 ms   2008.8 GB/s
+// WARP UNROLL:                 0.0676 ms   1000.3 GB/s
 // RECURSIVE:                   0.0928 ms   728.6 GB/s
 // SHARED MEMORY v2:            0.1191 ms   563.6 GB/s
 // SHARED MEMORY v1:            0.1328 ms   505.4 GB/s

@@ -140,12 +140,30 @@ def run_kernel(kernel: str, bin: str | None = None) -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
+def run_thrust(kernel: str = "vecsum") -> None:
+    import os
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    src = f"{PROJECT_DIR}/kernels/{kernel}/baselines/reduce_baseline.cu"
+    if not os.path.isfile(src):
+        raise SystemExit(f"no reduce baseline at {src}")
+    # `-arch=native` targets the GPU this function is running on, so the baseline
+    # is always compiled for the same card the vecsum benchmark ran on.
+    _run(["nvcc", "-O3", "-arch=native", "-o", "/tmp/reduce_baseline", src], cwd="/")
+    _run(["/tmp/reduce_baseline"], cwd="/")
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
     _run(["cargo", "oxide", "doctor"], cwd="/opt/warmup")
 
 
 @app.local_entrypoint()
-def main(kernel: str = "vecadd", bin: str = "", gpu: str = "") -> None:
+def main(kernel: str = "vecadd", bin: str = "", gpu: str = "", thrust: bool = False) -> None:
+    if thrust:
+        fn = run_thrust.with_options(gpu=gpu) if gpu else run_thrust
+        fn.remote(kernel)
+        return
     fn = run_kernel.with_options(gpu=gpu) if gpu else run_kernel
     fn.remote(kernel, bin or None)
