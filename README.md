@@ -17,8 +17,11 @@ and **run them on Modal**.
 ```
 kernels/vecadd/          one standalone crate per kernel
   Cargo.toml             git deps on cuda-device/host/core (pinned tag)
+  src/lib.rs             the #[cuda_module] kernel definition (shared)
   src/main.rs            correctness check  ->  ./run.sh vecadd
   src/bin/bench.rs       CUDA-event benchmark  ->  ./run.sh vecadd bench
+kernels/bench-util/      shared time_gpu_iters() helper, path-dep of every
+                         kernel crate's bench.rs (not run on its own)
 modal_app.py             builds the toolchain image; runs kernels on a GPU
 run.sh                   thin wrapper over `modal run`
 ```

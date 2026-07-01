@@ -1,0 +1,11 @@
+[package]
+name = "bench-util"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate: not part of any parent workspace. Path-dependency only
+# (used by sibling kernel crates), so it isn't run or built on its own.
+[workspace]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }

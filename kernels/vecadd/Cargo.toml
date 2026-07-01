@@ -2,6 +2,7 @@
 name = "vecadd"
 version = "0.1.0"
 edition = "2024"
+default-run = "vecadd"
 
 # Standalone crate: not part of any parent workspace.
 [workspace]
@@ -14,6 +15,7 @@ edition = "2024"
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+bench-util = { path = "../bench-util" }
 
 [profile.release]
 debug = false
