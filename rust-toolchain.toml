@@ -1,0 +1,8 @@
+# cuda-oxide's master-branch proc macros (cuda-macros) use nightly features
+# (#![feature(proc_macro_def_site)]), so stable can no longer build them —
+# which breaks rust-analyzer's proc-macro expansion. Pin the same nightly the
+# Modal image uses (RUST_TOOLCHAIN in modal_app.py) so local tooling and the
+# GPU builds agree. Covers all kernels/* crates (rustup resolves by directory).
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rust-analyzer", "clippy"]

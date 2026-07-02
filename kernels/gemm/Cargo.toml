@@ -1,0 +1,24 @@
+[package]
+name = "gemm"
+version = "0.1.0"
+edition = "2024"
+default-run = "gemm"
+
+# Standalone crate: not part of any parent workspace.
+[workspace]
+
+# cuda-oxide is not published to crates.io, so we pull the device/host/core
+# crates straight from the repo. Untagged (tracks the default branch, pinned by
+# Cargo.lock) because #[unroll] postdates the v0.2.1 tag. The Modal image still
+# warms its caches from CUDA_OXIDE_REF in ../../modal_app.py, so first builds
+# after a revision bump recompile the backend in-container (slower, but works).
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git"}
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git"}
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git"}
+bench-util = { path = "../bench-util" }
+nalgebra = "0.33"
+
+[profile.release]
+debug = false
+lto = true

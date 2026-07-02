@@ -8,4 +8,6 @@ edition = "2024"
 [workspace]
 
 [dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", tag = "v0.2.1" }
+# No tag: must resolve to the SAME revision as the kernel crates' cuda-oxide
+# deps (they are also untagged), or two incompatible cuda-core types coexist.
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
