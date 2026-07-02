@@ -38,7 +38,6 @@ pub mod kernels {
     static mut TILE_B: SharedArray<f32, B_SIZE> = SharedArray::UNINIT;
 
     #[kernel]
-    #[allow(unused_variables)]
     pub fn gemm(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
@@ -54,9 +53,6 @@ pub mod kernels {
         let mut reg_a = [0.0f32; T];
         let mut reg_b = [0.0f32; T];
 
-        // main loop. Not #[unroll]-ed: full unroll trips the 65536-op safety
-        // limit, and #[unroll(2)] measured slower (21.5 vs 26.2 TFLOP/s) — the
-        // fully-unrolled k-loop already provides the dense FMA blocks.
         let mut t = 0usize;
         while t < K / BK {
             let tile_offset = t * BK;
