@@ -123,6 +123,91 @@ pub mod kernels {
     }
 
     #[kernel]
+    pub fn gemm_register(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
+        // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
+        // Bounds are exact multiples of TILE
+
+        let row = thread::blockIdx_y() as usize * BM * T;
+        let col = thread::blockIdx_x() as usize * BN * T;
+        let tx = thread::threadIdx_x() as usize;
+        let ty = thread::threadIdx_y() as usize;
+        let r0 = ty * T;
+        let c0 = tx * T;
+
+        let mut acc = [[0.0f32; T]; T];
+        let mut reg_a = [0.0f32; T];
+        let mut reg_b = [0.0f32; T];
+
+        let mut t = 0usize;
+        while t < K / BK {
+            let tile_offset = t * BK;
+
+            // load tile from global to smem
+            let mut fill = 0usize;
+            // bound is elements/thread
+            #[unroll]
+            while fill < (BM*T*BK)/(BM*BN) {
+                let a_row = fill * BM;
+                let b_col = fill * BN;
+                unsafe {
+                    // fill rows/cols 0..T on first iter, T..T*2 on second ... etc
+                    TILE_A[(ty + a_row) * A_STRIDE + tx] = a[(row + ty + a_row) * K + tile_offset + tx];
+                    TILE_B[ty * B_STRIDE + tx + b_col] = b[(tile_offset + ty) * N + col + b_col + tx];
+                }
+                fill += 1;
+            }
+            sync_threads(); // sync after smem load
+
+            let mut k = 0usize;
+            #[unroll]
+            while k < BK {
+                // load from smem to registers for computation
+                let mut l = 0usize;
+                #[unroll]
+                while l < T {
+                    unsafe {
+                        reg_a[l] = TILE_A[(r0 + l) * A_STRIDE + k];
+                        reg_b[l] = TILE_B[k * B_STRIDE + c0 + l];
+                    }
+                    l += 1;
+                }
+
+                let mut i = 0usize;
+                #[unroll]
+                while i < T {
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < T {
+                        acc[i][j] += reg_a[i] * reg_b[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                k += 1;
+            }
+            sync_threads(); // sync before wiping tiles again.
+
+            t+=1;
+        }
+
+        // thread is responsible for TxT region of C.
+        let mut i = 0usize;
+        #[unroll]
+        while i < T {
+            let mut j = 0usize;
+            #[unroll]
+            while j < T {
+                // have to manually calculate the correct index into C.
+                let c_idx = (row + r0 + i) * N + (col + c0 + j);
+                let c_ij = unsafe {c.get_unchecked_mut(c_idx)};
+                *c_ij = acc[i][j];
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    #[kernel]
     #[allow(unused_variables)]
     pub fn gemm_smem(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
