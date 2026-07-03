@@ -45,12 +45,36 @@ fn main() {
     let tol = (K as f64) * (K as f64) * f32::EPSILON as f64;
 
     let mut max_err = 0.0f64;
+    let (mut n_tiny, mut n_small, mut n_big) = (0usize, 0usize, 0usize);
+    let mut worst: Vec<(f64, usize, usize)> = Vec::new();
     for i in 0..M {
         for j in 0..N {
             let g = c_host[i * N + j] as f64;
             let t = truth[(i, j)] as f64;
-            max_err = max_err.max((g - t).abs());
+            let e = (g - t).abs();
+            max_err = max_err.max(e);
+            if e > 1e-3 {
+                n_tiny += 1;
+            }
+            if e > 0.1 {
+                n_small += 1;
+            }
+            if e > 1.0 {
+                n_big += 1;
+                if worst.len() < 8 {
+                    worst.push((e, i, j));
+                }
+            }
         }
+    }
+    let total = M * N;
+    println!("err > 1e-3: {n_tiny}/{total}   err > 0.1: {n_small}/{total}   err > 1.0: {n_big}/{total}");
+    for (e, i, j) in &worst {
+        // block coords and intra-tile coords for the 128x128 output tiles
+        println!(
+            "  err={e:.3} at C[{i},{j}]  block=({},{})  intra=({},{})",
+            i / 128, j / 128, i % 128, j % 128
+        );
     }
 
     if max_err <= tol {

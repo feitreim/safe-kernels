@@ -153,6 +153,51 @@ def run_thrust(kernel: str = "vecsum") -> None:
     _run(["/tmp/reduce_baseline"], cwd="/")
 
 
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def run_sweep(kernel: str, configs: str) -> None:
+    """Bench several (BM BN T BK) configs in ONE container so they share a GPU.
+
+    `configs` is comma-separated, e.g. "16 16 8 16,16 16 8 8". Each config is
+    written into src/lib.rs, then correctness (main.rs) and the benchmark run
+    back-to-back. Container-side edits never touch the local checkout.
+    """
+    import re
+
+    proj = f"{PROJECT_DIR}/kernels/{kernel}"
+    lib = Path(proj, "src", "lib.rs")
+    for cfg in configs.split(","):
+        bm, bn, t, bk = cfg.split()
+        src = lib.read_text()
+        for name, val in (("BM", bm), ("BN", bn), ("T", t), ("BK", bk)):
+            src = re.sub(rf"(pub const {name}: usize = )\d+", rf"\g<1>{val}", src)
+        lib.write_text(src)
+        print(f"=== config BM={bm} BN={bn} T={t} BK={bk} ===", flush=True)
+        for cmd in (
+            ["cargo", "oxide", "run", kernel],
+            ["cargo", "oxide", "run", kernel, "--bin", "bench"],
+        ):
+            try:
+                _run(cmd, cwd=proj)
+            except subprocess.CalledProcessError as e:
+                print(f"config failed: {e}", flush=True)
+                break
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def dump_ptx(kernel: str) -> str:
+    import os
+
+    proj = f"{PROJECT_DIR}/kernels/{kernel}"
+    if not os.path.isdir(proj):
+        raise SystemExit(f"no kernel project at kernels/{kernel}")
+    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    for root, _, files in os.walk(proj):
+        for f in sorted(files):
+            if f.endswith(".ptx"):
+                return Path(root, f).read_text()
+    raise SystemExit(f"no .ptx produced under {proj}")
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
@@ -160,10 +205,25 @@ def doctor() -> None:
 
 
 @app.local_entrypoint()
-def main(kernel: str = "vecadd", bin: str = "", gpu: str = "", thrust: bool = False) -> None:
+def main(
+    kernel: str = "vecadd",
+    bin: str = "",
+    gpu: str = "",
+    thrust: bool = False,
+    ptx: bool = False,
+    sweep: str = "",
+) -> None:
     if thrust:
         fn = run_thrust.with_options(gpu=gpu) if gpu else run_thrust
         fn.remote(kernel)
+        return
+    if ptx:
+        fn = dump_ptx.with_options(gpu=gpu) if gpu else dump_ptx
+        print(fn.remote(kernel))
+        return
+    if sweep:
+        fn = run_sweep.with_options(gpu=gpu) if gpu else run_sweep
+        fn.remote(kernel, sweep)
         return
     fn = run_kernel.with_options(gpu=gpu) if gpu else run_kernel
     fn.remote(kernel, bin or None)

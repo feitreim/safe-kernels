@@ -28,8 +28,7 @@ pub mod kernels {
     use cuda_device::{
         Barrier, SharedArray, TmaDescriptor,
         barrier::{
-            fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
-            mbarrier_init, mbarrier_try_wait,
+            fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait
         },
         sync_threads, thread,
         tma::cp_async_bulk_tensor_2d_g2s,
@@ -48,10 +47,42 @@ pub mod kernels {
     pub const T: usize = 8; // thread computes TTILExTTILE
 
     // Tile dimensions
-    pub const A_SIZE: usize = BM * BK * T;
-    pub const B_SIZE: usize = BK * BN * T;
-    pub const A_STRIDE: usize = BK;
-    pub const B_STRIDE: usize = BN * T;
+    const A_SIZE: usize = BM * BK * T;
+    const B_SIZE: usize = BK * BN * T;
+    const A_STRIDE: usize = BK;
+    const B_STRIDE: usize = BN * T;
+    const TILE_BYTES: u32 = ((A_SIZE + B_SIZE) * 4) as u32; // 4 is f32 bytes.
+
+    #[inline(always)]
+    fn tma_load(
+        a: *const TmaDescriptor,
+        b: *const TmaDescriptor,
+        tile_a: *mut u8,
+        tile_b: *mut u8,
+        bar: *mut Barrier,
+        t: usize,
+        row: usize,
+        col: usize,
+        tid: usize,
+    ) -> u64 {
+        if tid == 0 {
+            unsafe {
+                cp_async_bulk_tensor_2d_g2s(tile_a, a, (t * BK) as i32, row as i32, bar);
+                cp_async_bulk_tensor_2d_g2s(tile_b, b, col as i32, (t * BK) as i32, bar);
+            }
+        }
+
+        // all threads arrive; the issuing thread also registers the
+        // expected TMA bytes for this phase.
+        let token = unsafe {
+            if tid == 0 {
+                mbarrier_arrive_expect_tx(bar, 1, TILE_BYTES)
+            } else {
+                mbarrier_arrive(bar)
+            }
+        };
+        token
+    }
 
     #[kernel]
     pub fn gemm(
@@ -61,11 +92,15 @@ pub mod kernels {
     ) {
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
-        static mut TILE_A: SharedArray<f32, A_SIZE, 128> = SharedArray::UNINIT;
-        static mut TILE_B: SharedArray<f32, B_SIZE, 128> = SharedArray::UNINIT;
-        const TILE_BYTES: u32 = ((A_SIZE + B_SIZE) * 4) as u32; // 4 is f32 bytes.
+        static mut TILE_A_1: SharedArray<f32, A_SIZE, 128> = SharedArray::UNINIT;
+        static mut TILE_B_1: SharedArray<f32, B_SIZE, 128> = SharedArray::UNINIT;
+        static mut TILE_A_2: SharedArray<f32, A_SIZE, 128> = SharedArray::UNINIT;
+        static mut TILE_B_2: SharedArray<f32, B_SIZE, 128> = SharedArray::UNINIT;
 
-        static mut BAR: Barrier = Barrier::UNINIT;
+        static mut BAR_1: Barrier = Barrier::UNINIT;
+        static mut BAR_2: Barrier = Barrier::UNINIT;
+        let mut token_1: u64;
+        let mut token_2: u64;
 
         let row = thread::blockIdx_y() as usize * BM * T;
         let col = thread::blockIdx_x() as usize * BN * T;
@@ -83,46 +118,46 @@ pub mod kernels {
         // to the TMA async proxy before any copy references it.
         if tid == 0 {
             unsafe {
-                mbarrier_init(&raw mut BAR, thread::blockDim_x() * thread::blockDim_y());
+                mbarrier_init(&raw mut BAR_1, thread::blockDim_x() * thread::blockDim_y());
+                mbarrier_init(&raw mut BAR_2, thread::blockDim_x() * thread::blockDim_y());
                 fence_proxy_async_shared_cta();
             }
         }
         sync_threads();
 
         let mut t = 0usize;
+        // pre-load first tile with TMA
+        // SAFETY: only tid = 0 issues the load.
+        token_1 = tma_load(
+            a,
+            b,
+            &raw mut TILE_A_1 as *mut u8,
+            &raw mut TILE_B_1 as *mut u8,
+            &raw mut BAR_1,
+            t,
+            row,
+            col,
+            tid,
+        );
+
         while t < K / BK {
-            // load tile with TMA
-            if tid == 0 {
-                unsafe {
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut TILE_A as *mut u8,
-                        a,
-                        (t * BK) as i32,
-                        row as i32,
-                        &raw mut BAR,
-                    );
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut TILE_B as *mut u8,
-                        b,
-                        col as i32,
-                        (t * BK) as i32,
-                        &raw mut BAR,
-                    );
-                }
-            }
+            // start the next load.
+            t += 1;
+            token_2 = tma_load(
+                a,
+                b,
+                &raw mut TILE_A_2 as *mut u8,
+                &raw mut TILE_B_2 as *mut u8,
+                &raw mut BAR_2,
+                t,
+                row,
+                col,
+                tid,
+            );
+            // wait for pipeline stage 1 load to finish,, NOT the load we just started.
+            unsafe { while !mbarrier_try_wait(&raw const BAR_1, token_1) {} }
 
-            // all threads arrive; the issuing thread also registers the
-            // expected TMA bytes for this phase.
-            let token = unsafe {
-                if tid == 0 {
-                    mbarrier_arrive_expect_tx(&raw const BAR, 1, TILE_BYTES)
-                } else {
-                    mbarrier_arrive(&raw const BAR)
-                }
-            };
-
-            unsafe { while !mbarrier_try_wait(&raw const BAR, token) {} }
-
+            // Compute with pipeline stage 1
             let mut k = 0usize;
             #[unroll]
             while k < BK {
@@ -131,8 +166,8 @@ pub mod kernels {
                 #[unroll]
                 while l < T {
                     unsafe {
-                        reg_a[l] = TILE_A[(r0 + l) * A_STRIDE + k];
-                        reg_b[l] = TILE_B[k * B_STRIDE + c0 + l];
+                        reg_a[l] = TILE_A_1[(r0 + l) * A_STRIDE + k];
+                        reg_b[l] = TILE_B_1[k * B_STRIDE + c0 + l];
                     }
                     l += 1;
                 }
@@ -150,10 +185,63 @@ pub mod kernels {
                 }
                 k += 1;
             }
-            sync_threads(); // TODO do i need this?
+
+            unsafe {fence_proxy_async_shared_cta();}
+            sync_threads();
+
+            // launch tma load for pipeline stage 1
             t += 1;
+            if t < K / BK {
+                token_1 = tma_load(
+                    a,
+                    b,
+                    &raw mut TILE_A_1 as *mut u8,
+                    &raw mut TILE_B_1 as *mut u8,
+                    &raw mut BAR_1,
+                    t,
+                    row,
+                    col,
+                    tid,
+                );
+            }
+
+            // wait for second pipeline stage.
+            unsafe { while !mbarrier_try_wait(&raw const BAR_2, token_2) {} }
+
+            // now perform computations with pipeline stage 2
+            let mut k = 0usize;
+            #[unroll]
+            while k < BK {
+                // load from smem to registers for computation
+                let mut l = 0usize;
+                #[unroll]
+                while l < T {
+                    unsafe {
+                        reg_a[l] = TILE_A_2[(r0 + l) * A_STRIDE + k];
+                        reg_b[l] = TILE_B_2[k * B_STRIDE + c0 + l];
+                    }
+                    l += 1;
+                }
+
+                let mut i = 0usize;
+                #[unroll]
+                while i < T {
+                    let mut j = 0usize;
+                    #[unroll]
+                    while j < T {
+                        acc[i][j] += reg_a[i] * reg_b[j];
+                        j += 1;
+                    }
+                    i += 1;
+                }
+                k += 1;
+            }
+            unsafe {fence_proxy_async_shared_cta();}
+            sync_threads();
+
         }
 
+        // === computations finished ===
         // thread is responsible for TxT region of C.
         let mut i = 0usize;
         #[unroll]
@@ -168,6 +256,14 @@ pub mod kernels {
                 j += 1;
             }
             i += 1;
+        }
+
+        thread::sync_threads();
+        if tid == 0 {
+            unsafe {
+                mbarrier_inval(&raw mut BAR_1);
+                mbarrier_inval(&raw mut BAR_2);
+            }
         }
     }
 
@@ -425,10 +521,11 @@ pub fn matmul(
 
 // BENCHMARKS:
 // -- GPU (H100):               avg time        throughput
-// REGISTER TILES (B=32,T=4):   avg=2.6268 ms   26161.1 GFLOPs  70.3 GB/s
-// REGISTER TILES (B=8,T=8):    avg=3.9705 ms   17307.6 GFLOPs  46.5 GB/s
-// SHARED+TILES:                avg=8.5085 ms   8076.5 GFLOPs   21.7 GB/s
-// NAIVE:                       avg=11.1397 ms  6168.9 GFLOPs   16.6 GB/s
+// TMA PIPELINE(=2)             2.4390 ms   28175.0 GFLOP/s  75.7 GB/s (min traffic)
+// REGISTER TILES (B=32,T=4):   2.6268 ms   26161.1 GFLOPs  70.3 GB/s
+// REGISTER TILES (B=8,T=8):    3.9705 ms   17307.6 GFLOPs  46.5 GB/s
+// SHARED+TILES:                8.5085 ms   8076.5 GFLOPs   21.7 GB/s
+// NAIVE:                       11.1397 ms  6168.9 GFLOPs   16.6 GB/s
 //
 // tuning sweep (BM=BN=BK required equal by the fill pattern; T = thread tile):
 //   B=8  T=8:  17.3 TFLOP/s  (64 thr)      B=16 T=8: 13.6  (256 thr, reg-bound)
