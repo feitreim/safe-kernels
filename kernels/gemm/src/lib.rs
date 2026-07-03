@@ -10,12 +10,30 @@
 //! compiled code references it), so `load` fails with `ModuleNotFound`. Loading
 //! from the file side-steps that.
 
-use cuda_core::{CudaStream, DeviceBuffer, DriverError, LaunchConfig};
-use cuda_device::{DisjointSlice, cuda_module, kernel};
+use cuda_core::{
+    CudaStream, DeviceBuffer, LaunchConfig,
+    sys::{
+        self as cuda_sys, CUtensorMap, CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE, cuTensorMapEncodeTiled,
+    },
+};
+use cuda_device::{DisjointSlice, TmaDescriptor, cuda_module, kernel};
+use std::mem::MaybeUninit;
 
 #[cuda_module]
 pub mod kernels {
-    use cuda_device::{SharedArray, sync_threads, thread};
+    use cuda_device::{
+        Barrier, SharedArray, TmaDescriptor,
+        barrier::{
+            fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
+            mbarrier_init, mbarrier_try_wait,
+        },
+        sync_threads, thread,
+        tma::cp_async_bulk_tensor_2d_g2s,
+    };
 
     use super::*;
 
@@ -23,29 +41,37 @@ pub mod kernels {
     // FLOPs = 2·M·N·K (one multiply + one add per inner-product term).
     pub const M: usize = 8192; // rows of A and C
     pub const N: usize = 1024; // cols of B and C
-    pub const K: usize = 4096; // shared / contraction dim
-    pub const BK: usize = 32;
-    pub const BN: usize = 32; // block is BN×BM threads
-    pub const BM: usize = 32; // block is BN×BM threads
-    pub const T: usize = 4; // thread computes TTILExTTILE
+    pub const K: usize = 4096; // contraction dim
+    pub const BK: usize = 16;
+    pub const BN: usize = 16; // block is BN×BM threads
+    pub const BM: usize = 16; // block is BN×BM threads
+    pub const T: usize = 8; // thread computes TTILExTTILE
 
     // Tile dimensions
     pub const A_SIZE: usize = BM * BK * T;
     pub const B_SIZE: usize = BK * BN * T;
     pub const A_STRIDE: usize = BK;
     pub const B_STRIDE: usize = BN * T;
-    static mut TILE_A: SharedArray<f32, A_SIZE> = SharedArray::UNINIT;
-    static mut TILE_B: SharedArray<f32, B_SIZE> = SharedArray::UNINIT;
 
     #[kernel]
-    pub fn gemm(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
+    pub fn gemm(
+        a: *const TmaDescriptor,
+        b: *const TmaDescriptor,
+        mut c: DisjointSlice<f32, thread::Index2D<N>>,
+    ) {
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
+        static mut TILE_A: SharedArray<f32, A_SIZE, 128> = SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<f32, B_SIZE, 128> = SharedArray::UNINIT;
+        const TILE_BYTES: u32 = ((A_SIZE + B_SIZE) * 4) as u32; // 4 is f32 bytes.
+
+        static mut BAR: Barrier = Barrier::UNINIT;
 
         let row = thread::blockIdx_y() as usize * BM * T;
         let col = thread::blockIdx_x() as usize * BN * T;
         let tx = thread::threadIdx_x() as usize;
         let ty = thread::threadIdx_y() as usize;
+        let tid = ty * thread::blockDim_x() as usize + tx;
         let r0 = ty * T;
         let c0 = tx * T;
 
@@ -53,25 +79,49 @@ pub mod kernels {
         let mut reg_a = [0.0f32; T];
         let mut reg_b = [0.0f32; T];
 
+        // one thread initializes the barrier; the fence makes the init visible
+        // to the TMA async proxy before any copy references it.
+        if tid == 0 {
+            unsafe {
+                mbarrier_init(&raw mut BAR, thread::blockDim_x() * thread::blockDim_y());
+                fence_proxy_async_shared_cta();
+            }
+        }
+        sync_threads();
+
         let mut t = 0usize;
         while t < K / BK {
-            let tile_offset = t * BK;
-
-            // load tile from global to smem
-            let mut fill = 0usize;
-            // bound is elements/thread
-            #[unroll]
-            while fill < (BM*T*BK)/(BM*BN) {
-                let a_row = fill * BM;
-                let b_col = fill * BN;
+            // load tile with TMA
+            if tid == 0 {
                 unsafe {
-                    // fill rows/cols 0..T on first iter, T..T*2 on second ... etc
-                    TILE_A[(ty + a_row) * A_STRIDE + tx] = a[(row + ty + a_row) * K + tile_offset + tx];
-                    TILE_B[ty * B_STRIDE + tx + b_col] = b[(tile_offset + ty) * N + col + b_col + tx];
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_A as *mut u8,
+                        a,
+                        (t * BK) as i32,
+                        row as i32,
+                        &raw mut BAR,
+                    );
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_B as *mut u8,
+                        b,
+                        col as i32,
+                        (t * BK) as i32,
+                        &raw mut BAR,
+                    );
                 }
-                fill += 1;
             }
-            sync_threads(); // sync after smem load
+
+            // all threads arrive; the issuing thread also registers the
+            // expected TMA bytes for this phase.
+            let token = unsafe {
+                if tid == 0 {
+                    mbarrier_arrive_expect_tx(&raw const BAR, 1, TILE_BYTES)
+                } else {
+                    mbarrier_arrive(&raw const BAR)
+                }
+            };
+
+            unsafe { while !mbarrier_try_wait(&raw const BAR, token) {} }
 
             let mut k = 0usize;
             #[unroll]
@@ -100,9 +150,8 @@ pub mod kernels {
                 }
                 k += 1;
             }
-            sync_threads(); // sync before wiping tiles again.
-
-            t+=1;
+            sync_threads(); // TODO do i need this?
+            t += 1;
         }
 
         // thread is responsible for TxT region of C.
@@ -114,7 +163,7 @@ pub mod kernels {
             while j < T {
                 // have to manually calculate the correct index into C.
                 let c_idx = (row + r0 + i) * N + (col + c0 + j);
-                let c_ij = unsafe {c.get_unchecked_mut(c_idx)};
+                let c_ij = unsafe { c.get_unchecked_mut(c_idx) };
                 *c_ij = acc[i][j];
                 j += 1;
             }
@@ -126,6 +175,8 @@ pub mod kernels {
     pub fn gemm_register(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
+        static mut TILE_A: SharedArray<f32, A_SIZE> = SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<f32, B_SIZE> = SharedArray::UNINIT;
 
         let row = thread::blockIdx_y() as usize * BM * T;
         let col = thread::blockIdx_x() as usize * BN * T;
@@ -146,13 +197,15 @@ pub mod kernels {
             let mut fill = 0usize;
             // bound is elements/thread
             #[unroll]
-            while fill < (BM*T*BK)/(BM*BN) {
+            while fill < (BM * T * BK) / (BM * BN) {
                 let a_row = fill * BM;
                 let b_col = fill * BN;
                 unsafe {
                     // fill rows/cols 0..T on first iter, T..T*2 on second ... etc
-                    TILE_A[(ty + a_row) * A_STRIDE + tx] = a[(row + ty + a_row) * K + tile_offset + tx];
-                    TILE_B[ty * B_STRIDE + tx + b_col] = b[(tile_offset + ty) * N + col + b_col + tx];
+                    TILE_A[(ty + a_row) * A_STRIDE + tx] =
+                        a[(row + ty + a_row) * K + tile_offset + tx];
+                    TILE_B[ty * B_STRIDE + tx + b_col] =
+                        b[(tile_offset + ty) * N + col + b_col + tx];
                 }
                 fill += 1;
             }
@@ -187,7 +240,7 @@ pub mod kernels {
             }
             sync_threads(); // sync before wiping tiles again.
 
-            t+=1;
+            t += 1;
         }
 
         // thread is responsible for TxT region of C.
@@ -199,7 +252,7 @@ pub mod kernels {
             while j < T {
                 // have to manually calculate the correct index into C.
                 let c_idx = (row + r0 + i) * N + (col + c0 + j);
-                let c_ij = unsafe {c.get_unchecked_mut(c_idx)};
+                let c_ij = unsafe { c.get_unchecked_mut(c_idx) };
                 *c_ij = acc[i][j];
                 j += 1;
             }
@@ -227,8 +280,8 @@ pub mod kernels {
 
             // load tile from global to smem
             unsafe {
-                TILE_A[ty * BK + tx] = a[row*K + tile_offset + tx];
-                TILE_B[ty * BK + tx] = b[(tile_offset + ty)*N + col];
+                TILE_A[ty * BK + tx] = a[row * K + tile_offset + tx];
+                TILE_B[ty * BK + tx] = b[(tile_offset + ty) * N + col];
             }
             sync_threads(); // sync after SMEM loads
 
@@ -241,7 +294,7 @@ pub mod kernels {
             }
             sync_threads(); // sync before wiping tiles again.
 
-            t+=1;
+            t += 1;
         }
 
         // const N makes this safe :)
@@ -263,7 +316,7 @@ pub mod kernels {
                 let mut sum = 0.0f32;
                 let mut k = 0;
                 while k < K {
-                    sum += a[row*K + k] * b[k*N + col];
+                    sum += a[row * K + k] * b[k * N + col];
                     k += 1;
                 }
                 *c_elem = sum;
@@ -279,7 +332,46 @@ pub mod kernels {
 // covers every output element of C once. `c` is allocated per call (zeroed, so
 // an unfinished kernel reads as all-zeros rather than garbage) and returned on
 // the device for the caller to copy down or time.
-use kernels::{LoadedModule, BM, BN, M, N, T};
+use kernels::{BK, BM, BN, K, LoadedModule, M, N, T};
+
+/// Create a TMA tensor map descriptor for a 2D f32 tensor
+fn create_tma_descriptor(
+    global_address: *mut std::ffi::c_void,
+    width: u64,
+    height: u64,
+    tile_width: u32,
+    tile_height: u32,
+) -> Result<CUtensorMap, Box<dyn std::error::Error>> {
+    let mut tensor_map = MaybeUninit::<CUtensorMap>::uninit();
+    let tensor_rank = 2u32;
+    let global_dim: [u64; 2] = [width, height];
+    let global_strides: [u64; 1] = [width * std::mem::size_of::<f32>() as u64];
+    let box_dim: [u32; 2] = [tile_width, tile_height];
+    let element_strides: [u32; 2] = [1, 1];
+
+    let result = unsafe {
+        cuTensorMapEncodeTiled(
+            tensor_map.as_mut_ptr(),
+            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+            tensor_rank,
+            global_address,
+            global_dim.as_ptr(),
+            global_strides.as_ptr(),
+            box_dim.as_ptr(),
+            element_strides.as_ptr(),
+            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+
+    if result != cuda_sys::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuTensorMapEncodeTiled failed: {:?}", result).into());
+    }
+
+    Ok(unsafe { tensor_map.assume_init() })
+}
 
 /// Launch geometry: grid tiles the M×N output, one thread per C element.
 /// `M` and `N` are exact multiples of `TILE`, so the grid covers C with no
@@ -298,9 +390,33 @@ pub fn matmul(
     module: &LoadedModule,
     a: &DeviceBuffer<f32>,
     b: &DeviceBuffer<f32>,
-) -> Result<DeviceBuffer<f32>, DriverError> {
+) -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
     let mut c = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
-    module.gemm(stream, launch(), a, b, &mut c)?;
+    let a_ptr = a.cu_deviceptr();
+    let a_map = create_tma_descriptor(
+        a_ptr as *mut std::ffi::c_void,
+        K as u64,
+        M as u64,
+        BK as u32,
+        (BM * T) as u32,
+    )?;
+    let dev_a_map = DeviceBuffer::from_host(stream, &a_map.opaque[..])?;
+    let b_ptr = b.cu_deviceptr();
+    let b_map = create_tma_descriptor(
+        b_ptr as *mut std::ffi::c_void,
+        N as u64,
+        K as u64,
+        (BN * T) as u32,
+        BK as u32,
+    )?;
+    let dev_b_map = DeviceBuffer::from_host(stream, &b_map.opaque[..])?;
+    module.gemm(
+        stream,
+        launch(),
+        dev_a_map.cu_deviceptr() as *const TmaDescriptor,
+        dev_b_map.cu_deviceptr() as *const TmaDescriptor,
+        &mut c,
+    )?;
     Ok(c)
 }
 
@@ -309,10 +425,10 @@ pub fn matmul(
 
 // BENCHMARKS:
 // -- GPU (H100):               avg time        throughput
-// REGISTER TILES (B=32,T=4):   avg=2.6268 ms   26161.1 GFLOP/s  70.3 GB/s
-// REGISTER TILES (B=8,T=8):    avg=3.9705 ms   17307.6 GFLOP/s  46.5 GB/s
-// SHARED+TILES:                avg=8.5085 ms   8076.5 GFLOP/s   21.7 GB/s
-// NAIVE:                       avg=11.1397 ms  6168.9 GFLOP/s   16.6 GB/s
+// REGISTER TILES (B=32,T=4):   avg=2.6268 ms   26161.1 GFLOPs  70.3 GB/s
+// REGISTER TILES (B=8,T=8):    avg=3.9705 ms   17307.6 GFLOPs  46.5 GB/s
+// SHARED+TILES:                avg=8.5085 ms   8076.5 GFLOPs   21.7 GB/s
+// NAIVE:                       avg=11.1397 ms  6168.9 GFLOPs   16.6 GB/s
 //
 // tuning sweep (BM=BN=BK required equal by the fill pattern; T = thread tile):
 //   B=8  T=8:  17.3 TFLOP/s  (64 thr)      B=16 T=8: 13.6  (256 thr, reg-bound)
