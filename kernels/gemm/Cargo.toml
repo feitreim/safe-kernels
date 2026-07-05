@@ -18,6 +18,8 @@ cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git"}
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git"}
 bench-util = { path = "../bench-util" }
 nalgebra = "0.33"
+# Host-side bf16 (kernel input precision); cuda-core impls DeviceCopy for it.
+half = "2"
 
 [profile.release]
 debug = false

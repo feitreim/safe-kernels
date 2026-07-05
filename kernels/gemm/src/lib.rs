@@ -13,10 +13,12 @@
 use cuda_core::{
     CudaStream, DeviceBuffer, LaunchConfig,
     sys::{
-        self as cuda_sys, CUtensorMap, CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        self as cuda_sys, CUtensorMap, CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
         CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
         CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
         CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
         CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_NONE, cuTensorMapEncodeTiled,
     },
 };
@@ -26,12 +28,23 @@ use std::mem::MaybeUninit;
 #[cuda_module]
 pub mod kernels {
     use cuda_device::{
-        Barrier, SharedArray, TmaDescriptor,
+        Barrier, ManagedBarrier, MmaBarrier, SharedArray, TmaBarrier, TmaDescriptor,
+        TmemUninit, Uninit,
         barrier::{
-            fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx, mbarrier_init, mbarrier_inval, mbarrier_try_wait
+            fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
+            mbarrier_init, mbarrier_inval, mbarrier_try_wait,
         },
-        sync_threads, thread,
+        sync_threads,
+        tcgen05::{
+            Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor,
+            Tcgen05MmaShape, Tcgen05SmemDescriptor,
+            Tcgen05SwizzleMode, TmemGuard, cvt_f32x2_bf16x2, stmatrix_m8n8_x2,
+            tcgen05_commit_shared_cluster, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
+            tcgen05_mma_f16,
+        },
+        thread,
         tma::cp_async_bulk_tensor_2d_g2s,
+        warp,
     };
 
     use super::*;
@@ -39,57 +52,293 @@ pub mod kernels {
     // C[M×N] = A[M×K] · B[K×N], all row-major, all f32.
     // FLOPs = 2·M·N·K (one multiply + one add per inner-product term).
     pub const M: usize = 8192; // rows of A and C
-    pub const N: usize = 1024; // cols of B and C
-    pub const K: usize = 4096; // contraction dim
-    pub const BK: usize = 16;
-    pub const BN: usize = 16; // block is BN×BM threads
-    pub const BM: usize = 16; // block is BN×BM threads
-    pub const T: usize = 8; // thread computes TTILExTTILE
+    pub const N: usize = 8192; // cols of B and C
+    pub const K: usize = 8192; // contraction dim
+    pub const BM: usize = 128;
+    pub const BN: usize = 128;
+    pub const BK: usize = 64;
 
-    // Tile dimensions
-    const A_SIZE: usize = BM * BK * T;
-    const B_SIZE: usize = BK * BN * T;
-    const A_STRIDE: usize = BK;
-    const B_STRIDE: usize = BN * T;
-    const TILE_BYTES: u32 = ((A_SIZE + B_SIZE) * 4) as u32; // 4 is f32 bytes.
-
-    #[inline(always)]
-    fn tma_load(
+    // Launch dims:
+    // grid dim     = (M / BM, N / BN, 1)
+    // block dim    = (128, 1, 1)
+    #[kernel]
+    pub fn gemm(
         a: *const TmaDescriptor,
-        b: *const TmaDescriptor,
-        tile_a: *mut u8,
-        tile_b: *mut u8,
-        bar: *mut Barrier,
-        t: usize,
-        row: usize,
-        col: usize,
-        tid: usize,
-    ) -> u64 {
-        if tid == 0 {
-            unsafe {
-                cp_async_bulk_tensor_2d_g2s(tile_a, a, (t * BK) as i32, row as i32, bar);
-                cp_async_bulk_tensor_2d_g2s(tile_b, b, col as i32, (t * BK) as i32, bar);
+        b: *const TmaDescriptor, // reminder, B should be transposed to be NxK first
+        mut c: DisjointSlice<u32>,
+    ) {
+        // SMEM tiles contain f16/bf16 and are shape:
+        // A: BM x BK
+        // B: BK x BN
+        // MMA instructions process MMA_K=16 at a time, so we have BK/MMA_K (4) MMA instructions
+        const BF16_SIZE: usize = 2;
+        const A_TILE_BYTES: usize = BM * BK * BF16_SIZE; // * 2 bc f16 is 2x u8
+        const B_TILE_BYTES: usize = BK * BN * BF16_SIZE;
+        const COMBINED_BYTES: u32 = (A_TILE_BYTES + B_TILE_BYTES) as u32;
+        static mut TILE_A: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut TILE_B: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
+        const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
+        static mut SMEM_OUT: SharedArray<u32, 8192, 128> = SharedArray::UNINIT;
+        static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+        static mut TMA_BAR: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR: Barrier = Barrier::UNINIT;
+
+        // TMA will Swizzle/copy BM/BN x BK f16 tiles from GMEM to SMEM the
+        // swizzling is so that the matrices are laid out correctly for MMA.
+        //
+        // So LBO, or the byte distance along K dim to the neighbor core
+        // matrix, is 16b (hardcoded row size of a core matrix)
+        // and SBO, byte distance to the neighbor core matrix along the
+        // strided dim, is 1024b, because we have 8 K-groups with BK=64, so
+        // the 8 K-groups for a row of size 128b, then each core matrix has
+        // 8 rows, so the next row of core matrices is 8 x 128b = 1024b.
+        const LBO_BYTES: u32 = 16;
+        const SBO_BYTES: u32 = 1024;
+        const SWIZZLE_128B: u8 = 2;
+        let swizzle = Tcgen05SwizzleMode::Swizzle128B;
+
+        // live info:
+        let tid = thread::threadIdx_x();
+        let warp_id = warp::warp_id();
+        let lane_id = tid % 32;
+        let thread0 = tid == 0;
+
+        let tile_m = thread::blockIdx_x(); // which BM-row block of C
+        let tile_n = thread::blockIdx_y(); // which BM-col block of C
+        let m_offset = (tile_m as usize * BM) as i32;
+        let n_offset = (tile_n as usize * BN) as i32;
+
+        // --- Initialize Barriers and TMEM ---
+        let tma_bar = ManagedBarrier::<Uninit, TmaBarrier>::from_static(&raw mut TMA_BAR);
+        let mma_bar = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR);
+
+        let tma_bar = unsafe { tma_bar.init(thread::blockDim_x()) };
+        let mma_bar = unsafe { mma_bar.init(1) };
+        let mut tma_token;
+        unsafe { fence_proxy_async_shared_cta() };
+        thread::sync_threads();
+
+        let tmem =
+            TmemGuard::<TmemUninit, { BN as u32 }>::from_static(&raw mut TMEM_ADDR as *mut u32);
+        let tmem = unsafe { tmem.alloc() };
+        thread::sync_threads();
+
+        let mma_desc = Tcgen05InstructionDescriptor::builder()
+            .shape(Tcgen05MmaShape::M128_N128)
+            .element_type(Tcgen05ElementType::BF16)
+            .accumulator_type(Tcgen05AccumulatorType::F32)
+            .build();
+
+        // PHASE 1: K-Loop
+        let k_iters = (K / BK) as u32;
+        let mut k_idx: u32 = 0;
+
+        while k_idx < k_iters {
+            let phase = k_idx & 1; // % 2
+
+            // TMA Load
+            // load the whole 128x64 tile at once.
+            if thread0 {
+                let k_base = (k_idx as usize * BK) as i32;
+                unsafe {
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_A as *mut u8,
+                        a,
+                        k_base,
+                        m_offset,
+                        &raw mut TMA_BAR,
+                    );
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_B as *mut u8,
+                        b,
+                        k_base,
+                        n_offset,
+                        &raw mut TMA_BAR,
+                    );
+                }
+                tma_token = tma_bar.arrive_expect_tx(COMBINED_BYTES);
+            } else {
+                tma_token = tma_bar.arrive();
             }
+
+            tma_bar.wait(tma_token);
+
+            // --- MMAs within the Tile ---
+            // each MMA can consume K=16 at a time (two
+            // k groups) LBO = 16, so 2xLBO is 32 bytes, thats the offset
+            // between each K=16
+            if thread0 {
+                let smem_a_ptr = &raw const TILE_A as u64;
+                let smem_b_ptr = &raw const TILE_B as u64;
+
+                let mut k_sub = 0;
+                while k_sub < BK as u64 / 16 {
+                    let k_offset = (k_sub * 32) as u64;
+                    let a_desc = Tcgen05SmemDescriptor::from_bytes(
+                        smem_a_ptr + k_offset,
+                        LBO_BYTES,
+                        SBO_BYTES,
+                        swizzle,
+                    );
+                    let b_desc = Tcgen05SmemDescriptor::from_bytes(
+                        smem_b_ptr + k_offset,
+                        LBO_BYTES,
+                        SBO_BYTES,
+                        swizzle,
+                    );
+
+                    // accumulate into d always except for the very first time.
+                    let accumlate = k_idx > 0 || k_sub > 0;
+                    unsafe {
+                        tcgen05_mma_f16(
+                            tmem.address().raw(),
+                            a_desc.raw(),
+                            b_desc.raw(),
+                            mma_desc.raw(),
+                            accumlate,
+                        )
+                    };
+                    k_sub += 1;
+                }
+
+                unsafe {
+                    tcgen05_commit_shared_cluster(&raw mut MMA_BAR as *mut u64);
+                }
+            }
+
+            while !mma_bar.try_wait_parity(phase) {} // all threads wait
+            sync_threads();
+            k_idx += 1;
         }
 
-        // all threads arrive; the issuing thread also registers the
-        // expected TMA bytes for this phase.
-        let token = unsafe {
-            if tid == 0 {
-                mbarrier_arrive_expect_tx(bar, 1, TILE_BYTES)
-            } else {
-                mbarrier_arrive(bar)
+        // --- Phase 2: TMEM -> Registers -> SMEM ---
+
+        // each warp loads and then moves to smem
+        // TMEM is BM x BN (128 x 128)
+        // values are f32
+        // tcgen05_ld_16x256b_pure loads 4x f32 per thread
+        // loads 16 rows x 8 columns
+        // so we load 2x matrices with a col offset of 16
+        // when we pass the address its packed (row << 16) | column
+        // so the addr is tmem.address + (tmem_row << 16) | col_offset
+        // lines up exactly with stmatrix_m8n8_x2
+        let warp_row = (warp_id * 32) as usize;
+        let row_stride_bytes = BN * 2;
+        let col_step = 16;
+
+        // you are probably thinking:
+        // "where did you get these numbers? it feels like they dont make any
+        // sense?"
+        // and you would be correct, instead of each lane actually computing
+        // real addresses, each lane(thread) holds data, but then only lanes
+        // 0-15 provide addresses.
+        // The load command we are using (stmatrix_m8n8_x2) takes 2 8x8
+        // matrices, it is designed to match the output from the tmem loads we
+        // used. with that in mind lanes 0-7 compute the row addresses for the
+        // first matrix, and lanes 8-15 compute the row addresses for the
+        // second.
+        let second_load_offset = 8; // high columns
+        let row_within_8 = (lane_id % 8) as usize;
+        let is_second_matrix = (8..16).contains(&lane_id);
+        let col_offset_for_matrix2 = if is_second_matrix { 16usize } else { 0usize };
+
+        let mut tmem_row_offset = 0u32;
+        while tmem_row_offset < 32 {
+            let tmem_row = warp_row as u32 + tmem_row_offset;
+
+            let mut col_block = 0u32;
+            while col_block < 8 {
+                let col_offset = (col_block * col_step) as usize;
+                unsafe {
+                    let regs_a = tcgen05_ld_16x256b_pure(
+                        tmem.address().raw() + (tmem_row << 16) + col_offset as u32,
+                    );
+                    tcgen05_load_wait();
+                    let regs_b = tcgen05_ld_16x256b_pure(
+                        tmem.address().raw() + (tmem_row << 16) + col_offset as u32 + second_load_offset,
+                    );
+                    tcgen05_load_wait();
+
+                    let p0_lo = cvt_f32x2_bf16x2(regs_a.x(), regs_a.y());
+                    let p1_lo = cvt_f32x2_bf16x2(regs_b.x(), regs_b.y());
+
+                    let out_row_lo = tmem_row as usize + row_within_8;
+                    let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
+                        out_row_lo * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
+                    );
+                    stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
+
+                    let p0_hi = cvt_f32x2_bf16x2(regs_a.z(), regs_a.w());
+                    let p1_hi = cvt_f32x2_bf16x2(regs_b.z(), regs_b.w());
+                    let out_row_hi = tmem_row as usize + row_within_8 + 8; // 8 to stagger by extra 8 rows
+                    let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
+                        out_row_hi * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
+                    );
+                    stmatrix_m8n8_x2(smem_addr_hi, p0_hi, p1_hi);
+                }
+
+                col_block += 1;
             }
-        };
-        token
+
+            tmem_row_offset += 16;
+        }
+        sync_threads();
+
+        // --- Phase 3: SMEM -> Global ---
+        // Grid is (M / BM, N / BN, 1)
+        // Block is (128, 1, 1)
+        // SMEM_OUT is BM x BN
+        // we are moving packed bf16 as u32, so have 1/2 as many columns
+        let width = (N / 2) as usize;
+        let tile_row_base = tile_m as usize * BM;
+        let tile_col_base = tile_n as usize * (BN / 2);
+
+        // interate over the SMEM out linearly for coalesced loads
+        let mut local_idx = tid as usize;
+        while local_idx < BM * (BN / 2) {
+            // row is the top local_idx / width
+            let local_row = local_idx >> 6;
+            // col is only the last 6 bits, equiv to local_idx % width
+            let local_col = local_idx & 63;
+
+            let global_row = tile_row_base + local_row;
+            let global_col = tile_col_base + local_col;
+            let global_idx = global_row * width + global_col;
+
+            unsafe {
+                *c.get_unchecked_mut(global_idx) = SMEM_OUT[local_idx];
+            }
+            local_idx += 128;
+        }
+
+        // --- Phase 4: Cleanup ---
+        sync_threads();
+        // dealloc tmem
+        let _dead = unsafe { tmem.dealloc() };
+        let _tma_bar = unsafe { tma_bar.inval() };
+        let _mma_bar = unsafe { mma_bar.inval() };
     }
 
     #[kernel]
-    pub fn gemm(
+    pub fn gemm_tma_pipeline(
         a: *const TmaDescriptor,
         b: *const TmaDescriptor,
         mut c: DisjointSlice<f32, thread::Index2D<N>>,
     ) {
+        // Frozen copies of the tuning consts (shadowing the module-level ones)
+        // so this kernel stays intact when they change for the next kernel.
+        // M/N/K stay module-level: N is baked into the signature above.
+        const BK: usize = 16;
+        const BN: usize = 16; // block is BN×BM threads
+        const BM: usize = 16; // block is BN×BM threads
+        const T: usize = 8; // thread computes TTILExTTILE
+        const A_SIZE: usize = BM * BK * T;
+        const B_SIZE: usize = BK * BN * T;
+        const A_STRIDE: usize = BK;
+        const B_STRIDE: usize = BN * T;
+        const TILE_BYTES: u32 = ((A_SIZE + B_SIZE) * 4) as u32; // 4 is f32 bytes.
+
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
         static mut TILE_A_1: SharedArray<f32, A_SIZE, 128> = SharedArray::UNINIT;
@@ -128,32 +377,62 @@ pub mod kernels {
         let mut t = 0usize;
         // pre-load first tile with TMA
         // SAFETY: only tid = 0 issues the load.
-        token_1 = tma_load(
-            a,
-            b,
-            &raw mut TILE_A_1 as *mut u8,
-            &raw mut TILE_B_1 as *mut u8,
-            &raw mut BAR_1,
-            t,
-            row,
-            col,
-            tid,
-        );
+        if tid == 0 {
+            unsafe {
+                cp_async_bulk_tensor_2d_g2s(
+                    &raw mut TILE_A_1 as *mut u8,
+                    a,
+                    (t * BK) as i32,
+                    row as i32,
+                    &raw mut BAR_1,
+                );
+                cp_async_bulk_tensor_2d_g2s(
+                    &raw mut TILE_B_1 as *mut u8,
+                    b,
+                    col as i32,
+                    (t * BK) as i32,
+                    &raw mut BAR_1,
+                );
+            }
+        }
+        // all threads arrive; the issuing thread also registers the
+        // expected TMA bytes for this phase.
+        token_1 = unsafe {
+            if tid == 0 {
+                mbarrier_arrive_expect_tx(&raw mut BAR_1, 1, TILE_BYTES)
+            } else {
+                mbarrier_arrive(&raw mut BAR_1)
+            }
+        };
 
         while t < K / BK {
             // start the next load.
             t += 1;
-            token_2 = tma_load(
-                a,
-                b,
-                &raw mut TILE_A_2 as *mut u8,
-                &raw mut TILE_B_2 as *mut u8,
-                &raw mut BAR_2,
-                t,
-                row,
-                col,
-                tid,
-            );
+            if tid == 0 {
+                unsafe {
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_A_2 as *mut u8,
+                        a,
+                        (t * BK) as i32,
+                        row as i32,
+                        &raw mut BAR_2,
+                    );
+                    cp_async_bulk_tensor_2d_g2s(
+                        &raw mut TILE_B_2 as *mut u8,
+                        b,
+                        col as i32,
+                        (t * BK) as i32,
+                        &raw mut BAR_2,
+                    );
+                }
+            }
+            token_2 = unsafe {
+                if tid == 0 {
+                    mbarrier_arrive_expect_tx(&raw mut BAR_2, 1, TILE_BYTES)
+                } else {
+                    mbarrier_arrive(&raw mut BAR_2)
+                }
+            };
             // wait for pipeline stage 1 load to finish,, NOT the load we just started.
             unsafe { while !mbarrier_try_wait(&raw const BAR_1, token_1) {} }
 
@@ -186,23 +465,39 @@ pub mod kernels {
                 k += 1;
             }
 
-            unsafe {fence_proxy_async_shared_cta();}
+            unsafe {
+                fence_proxy_async_shared_cta();
+            }
             sync_threads();
 
             // launch tma load for pipeline stage 1
             t += 1;
             if t < K / BK {
-                token_1 = tma_load(
-                    a,
-                    b,
-                    &raw mut TILE_A_1 as *mut u8,
-                    &raw mut TILE_B_1 as *mut u8,
-                    &raw mut BAR_1,
-                    t,
-                    row,
-                    col,
-                    tid,
-                );
+                if tid == 0 {
+                    unsafe {
+                        cp_async_bulk_tensor_2d_g2s(
+                            &raw mut TILE_A_1 as *mut u8,
+                            a,
+                            (t * BK) as i32,
+                            row as i32,
+                            &raw mut BAR_1,
+                        );
+                        cp_async_bulk_tensor_2d_g2s(
+                            &raw mut TILE_B_1 as *mut u8,
+                            b,
+                            col as i32,
+                            (t * BK) as i32,
+                            &raw mut BAR_1,
+                        );
+                    }
+                }
+                token_1 = unsafe {
+                    if tid == 0 {
+                        mbarrier_arrive_expect_tx(&raw mut BAR_1, 1, TILE_BYTES)
+                    } else {
+                        mbarrier_arrive(&raw mut BAR_1)
+                    }
+                };
             }
 
             // wait for second pipeline stage.
@@ -236,9 +531,10 @@ pub mod kernels {
                 }
                 k += 1;
             }
-            unsafe {fence_proxy_async_shared_cta();}
+            unsafe {
+                fence_proxy_async_shared_cta();
+            }
             sync_threads();
-
         }
 
         // === computations finished ===
@@ -269,6 +565,17 @@ pub mod kernels {
 
     #[kernel]
     pub fn gemm_register(a: &[f32], b: &[f32], mut c: DisjointSlice<f32, thread::Index2D<N>>) {
+        // Frozen copies of the tuning consts (shadowing the module-level ones)
+        // so this kernel stays intact when they change for the next kernel.
+        const BK: usize = 16;
+        const BN: usize = 16; // block is BN×BM threads
+        const BM: usize = 16; // block is BN×BM threads
+        const T: usize = 8; // thread computes TTILExTTILE
+        const A_SIZE: usize = BM * BK * T;
+        const B_SIZE: usize = BK * BN * T;
+        const A_STRIDE: usize = BK;
+        const B_STRIDE: usize = BN * T;
+
         // row-major indexing: a[row*K + k], b[k*N + col], c[row*N + col].
         // Bounds are exact multiples of TILE
         static mut TILE_A: SharedArray<f32, A_SIZE> = SharedArray::UNINIT;
@@ -422,16 +729,89 @@ pub mod kernels {
 }
 
 // ---------------------------------------------------------------------------
-// Host-side GEMM driver.
+// Host-side GEMM driver for the tcgen05 kernel.
 //
-// A single 2-D launch: a grid of (N/TILE, M/TILE) blocks of TILE×TILE threads
-// covers every output element of C once. `c` is allocated per call (zeroed, so
+// The kernel consumes bf16 inputs through 128B-swizzled TMA descriptors: A is
+// M×K row-major, and B must be pre-transposed to N×K (see `transpose`) so both
+// descriptors are K-major. C comes back as M×N bf16 packed two-per-u32, the
+// layout the stmatrix epilogue produces. `c` is allocated per call (zeroed, so
 // an unfinished kernel reads as all-zeros rather than garbage) and returned on
 // the device for the caller to copy down or time.
-use kernels::{BK, BM, BN, K, LoadedModule, M, N, T};
+use half::bf16;
+use kernels::{BK, BM, BN, K, LoadedModule, M, N};
 
-/// Create a TMA tensor map descriptor for a 2D f32 tensor
+/// Round f32 host data to bf16, the kernel's input precision.
+pub fn to_bf16(v: &[f32]) -> Vec<bf16> {
+    v.iter().map(|&x| bf16::from_f32(x)).collect()
+}
+
+/// Unpack the kernel's C buffer (two bf16 per u32, low half first) to f32.
+pub fn from_packed_bf16(v: &[u32]) -> Vec<f32> {
+    v.iter()
+        .flat_map(|&p| {
+            [
+                bf16::from_bits(p as u16).to_f32(),
+                bf16::from_bits((p >> 16) as u16).to_f32(),
+            ]
+        })
+        .collect()
+}
+
+/// Transpose a row-major `rows`×`cols` matrix.
+pub fn transpose<T: Copy>(v: &[T], rows: usize, cols: usize) -> Vec<T> {
+    (0..cols)
+        .flat_map(|col| (0..rows).map(move |row| v[row * cols + col]))
+        .collect()
+}
+
+/// Create a TMA tensor map descriptor for a 2D bf16 tensor with SWIZZLE_128B.
+///
+/// TMA applies the 128-byte XOR swizzle during the GMEM→SMEM copy, so the
+/// kernel's SMEM descriptors (built with `Swizzle128B`) see core matrices at
+/// the MMA's hardcoded strides. The swizzle needs the box inner dim to span
+/// exactly 128 bytes: BK (64) bf16 elements.
 fn create_tma_descriptor(
+    global_address: *mut std::ffi::c_void,
+    width: u64,
+    height: u64,
+    tile_width: u32,
+    tile_height: u32,
+) -> Result<CUtensorMap, Box<dyn std::error::Error>> {
+    let mut tensor_map = MaybeUninit::<CUtensorMap>::uninit();
+    let tensor_rank = 2u32;
+    let global_dim: [u64; 2] = [width, height];
+    let global_strides: [u64; 1] = [width * std::mem::size_of::<bf16>() as u64];
+    let box_dim: [u32; 2] = [tile_width, tile_height];
+    let element_strides: [u32; 2] = [1, 1];
+
+    let result = unsafe {
+        cuTensorMapEncodeTiled(
+            tensor_map.as_mut_ptr(),
+            CUtensorMapDataType_enum_CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            tensor_rank,
+            global_address,
+            global_dim.as_ptr(),
+            global_strides.as_ptr(),
+            box_dim.as_ptr(),
+            element_strides.as_ptr(),
+            CUtensorMapInterleave_enum_CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle_enum_CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion_enum_CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CUtensorMapFloatOOBfill_enum_CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        )
+    };
+
+    if result != cuda_sys::cudaError_enum_CUDA_SUCCESS {
+        return Err(format!("cuTensorMapEncodeTiled failed: {:?}", result).into());
+    }
+
+    Ok(unsafe { tensor_map.assume_init() })
+}
+
+/// Create a plain (unswizzled) TMA tensor map descriptor for a 2D f32
+/// tensor. Used by the pre-tcgen05 `gemm_tma_pipeline` kernel, which copies
+/// row-major f32 tiles verbatim.
+pub fn create_tma_descriptor_f32(
     global_address: *mut std::ffi::c_void,
     width: u64,
     height: u64,
@@ -463,65 +843,113 @@ fn create_tma_descriptor(
     };
 
     if result != cuda_sys::cudaError_enum_CUDA_SUCCESS {
-        return Err(format!("cuTensorMapEncodeTiled failed: {:?}", result).into());
+        return Err(format!("cuTensorMapEncodeTiled (f32) failed: {:?}", result).into());
     }
 
     Ok(unsafe { tensor_map.assume_init() })
 }
 
-/// Launch geometry: grid tiles the M×N output, one thread per C element.
-/// `M` and `N` are exact multiples of `TILE`, so the grid covers C with no
-/// partial edge blocks.
+/// One CTA per BM×BN output tile, 128 threads (4 warps) per CTA:
+/// blockIdx.x walks the M/BM row tiles, blockIdx.y the N/BN column tiles.
 fn launch() -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((N / (BN * T)) as u32, (M / (BM * T)) as u32, 1),
-        block_dim: (BN as u32, BM as u32, 1),
+        grid_dim: ((M / BM) as u32, (N / BN) as u32, 1),
+        block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     }
 }
 
-/// Compute `C = A · B` on the device, returning the M×N result buffer.
+/// Device-side launch state for `C = A · B`: the TMA descriptors and output
+/// buffer, built once so repeated launches (benchmarking) time only the
+/// kernel — not two descriptor uploads and a 16 MB allocation per call.
+///
+/// `a` is M×K bf16 row-major; `b_t` is B pre-transposed to N×K bf16
+/// row-major, so its TMA descriptor is K-major like A's. `c` is M×N bf16
+/// packed two-per-u32 (M·N/2 u32s; unpack with [`from_packed_bf16`]).
+pub struct Gemm {
+    dev_a_map: DeviceBuffer<u64>,
+    dev_b_map: DeviceBuffer<u64>,
+    pub c: DeviceBuffer<u32>,
+}
+
+impl Gemm {
+    pub fn new(
+        stream: &CudaStream,
+        a: &DeviceBuffer<bf16>,
+        b_t: &DeviceBuffer<bf16>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Zeroed only so an unfinished kernel reads as all-zeros rather than
+        // garbage; a completed launch writes every element.
+        let c = DeviceBuffer::<u32>::zeroed(stream, M * N / 2)?;
+        let a_map = create_tma_descriptor(
+            a.cu_deviceptr() as *mut std::ffi::c_void,
+            K as u64,
+            M as u64,
+            BK as u32,
+            BM as u32,
+        )?;
+        let dev_a_map = DeviceBuffer::from_host(stream, &a_map.opaque[..])?;
+        let b_map = create_tma_descriptor(
+            b_t.cu_deviceptr() as *mut std::ffi::c_void,
+            K as u64,
+            N as u64,
+            BK as u32,
+            BN as u32,
+        )?;
+        let dev_b_map = DeviceBuffer::from_host(stream, &b_map.opaque[..])?;
+        Ok(Self {
+            dev_a_map,
+            dev_b_map,
+            c,
+        })
+    }
+
+    pub fn launch(
+        &mut self,
+        stream: &CudaStream,
+        module: &LoadedModule,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        module.gemm(
+            stream,
+            launch(),
+            self.dev_a_map.cu_deviceptr() as *const TmaDescriptor,
+            self.dev_b_map.cu_deviceptr() as *const TmaDescriptor,
+            &mut self.c,
+        )?;
+        Ok(())
+    }
+}
+
+/// One-shot convenience for correctness checks: build the descriptors,
+/// launch once, return C.
 pub fn matmul(
     stream: &CudaStream,
     module: &LoadedModule,
-    a: &DeviceBuffer<f32>,
-    b: &DeviceBuffer<f32>,
-) -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
-    let mut c = DeviceBuffer::<f32>::zeroed(stream, M * N)?;
-    let a_ptr = a.cu_deviceptr();
-    let a_map = create_tma_descriptor(
-        a_ptr as *mut std::ffi::c_void,
-        K as u64,
-        M as u64,
-        BK as u32,
-        (BM * T) as u32,
-    )?;
-    let dev_a_map = DeviceBuffer::from_host(stream, &a_map.opaque[..])?;
-    let b_ptr = b.cu_deviceptr();
-    let b_map = create_tma_descriptor(
-        b_ptr as *mut std::ffi::c_void,
-        N as u64,
-        K as u64,
-        (BN * T) as u32,
-        BK as u32,
-    )?;
-    let dev_b_map = DeviceBuffer::from_host(stream, &b_map.opaque[..])?;
-    module.gemm(
-        stream,
-        launch(),
-        dev_a_map.cu_deviceptr() as *const TmaDescriptor,
-        dev_b_map.cu_deviceptr() as *const TmaDescriptor,
-        &mut c,
-    )?;
-    Ok(c)
+    a: &DeviceBuffer<bf16>,
+    b_t: &DeviceBuffer<bf16>,
+) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+    let mut gemm = Gemm::new(stream, a, b_t)?;
+    gemm.launch(stream, module)?;
+    Ok(gemm.c)
 }
 
 // BASELINE
 // cuBLAS SGEMM  (fill in once measured)
 
 // BENCHMARKS:
-// -- GPU (H100):               avg time        throughput
-// TMA PIPELINE(=2)             2.4390 ms   28175.0 GFLOP/s  75.7 GB/s (min traffic)
+// -- GPU (B200), 8192×8192×8192, bench_all (same shape/data, fair ladder):
+// TCGEN05 v1                   4.0277 ms   273.0 TFLOPs    (19.5% of ~1400 bf16 SoL)
+// TMA PIPELINE(=2)             23.0041 ms  47.8 TFLOPs
+// REGISTER TILES (B=16,T=8):   36.9776 ms  29.7 TFLOPs
+// NAIVE:                       164.7083 ms 6.7 TFLOPs
+// (SHARED+TILES unlaunchable at module BK=64: needs a local BK=32 freeze)
+//
+// -- GPU (B200), 8192×1024×4096 (old shape; timing included per-call
+//    alloc + descriptor uploads — superseded by the numbers above):
+// TCGEN05 v1                   0.8972 ms   76.6 TFLOPs     102.8 GB/s
+// TMA PIPELINE(=2)                         29.3 TFLOPs
+// -- GPU (H100), 8192×1024×4096:
+// TMA PIPELINE(=2)             2.4390 ms   28175.0 GFLOPs  75.7 GB/s (min traffic)
 // REGISTER TILES (B=32,T=4):   2.6268 ms   26161.1 GFLOPs  70.3 GB/s
 // REGISTER TILES (B=8,T=8):    3.9705 ms   17307.6 GFLOPs  46.5 GB/s
 // SHARED+TILES:                8.5085 ms   8076.5 GFLOPs   21.7 GB/s
