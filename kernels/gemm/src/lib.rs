@@ -79,11 +79,14 @@ pub mod kernels {
         const A_TILE_BYTES: usize = BM * BK * BF16_SIZE; // * 2 bc f16 is 2x u8
         const B_TILE_BYTES: usize = BK * BN * BF16_SIZE;
         const COMBINED_BYTES: u32 = (A_TILE_BYTES + B_TILE_BYTES) as u32;
+
+        // setup smem
         static mut A0_TILE: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut B0_TILE: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut A1_TILE: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut B1_TILE: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
+
         const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
         static mut SMEM_OUT: SharedArray<u32, OUTPUT_SIZE, 128> = SharedArray::UNINIT;
         static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
@@ -123,7 +126,7 @@ pub mod kernels {
         let tma_bar_1 = ManagedBarrier::<Uninit, TmaBarrier>::from_static(&raw mut TMA_BAR_1);
         let mma_bar_0 = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR_0);
         let mma_bar_1 = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR_1);
-        let compute_bar = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut COMPUTE_BAR);
+        let compute_bar = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut COMPUTE_BAR);
 
         let tma_bar_0 = unsafe { tma_bar_0.init(1) };
         let tma_bar_1 = unsafe { tma_bar_1.init(1) };
@@ -167,52 +170,43 @@ pub mod kernels {
                 let phase = k_idx & 1;
                 let parity = (k_idx >> 1) & 1;
 
+                let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
+                    0 => (
+                        &raw mut A0_TILE as *mut u8,
+                        &raw mut B0_TILE as *mut u8,
+                        &mma_bar_0,
+                        &tma_bar_0,
+                    ),
+                    _ => (
+                        &raw mut A1_TILE as *mut u8,
+                        &raw mut B1_TILE as *mut u8,
+                        &mma_bar_1,
+                        &tma_bar_1,
+                    ),
+                };
+
                 // Wait for MMA computation to finish, freeing the tile.
-                if phase == 0 {
-                    while !mma_bar_0.try_wait_parity(parity) {}
-                } else {
-                    while !mma_bar_1.try_wait_parity(parity) {}
-                }
+                while !mma_bar.try_wait_parity(parity) {}
 
                 if lane0 {
                     let k_offset = (k_idx as usize * BK) as i32;
-                    if phase == 0 {
-                        unsafe {
-                            cp_async_bulk_tensor_2d_g2s(
-                                &raw mut A0_TILE as *mut u8,
-                                a,
-                                k_offset,
-                                m_offset,
-                                &raw mut TMA_BAR_0,
-                            );
-                            cp_async_bulk_tensor_2d_g2s(
-                                &raw mut B0_TILE as *mut u8,
-                                b,
-                                k_offset,
-                                n_offset,
-                                &raw mut TMA_BAR_0,
-                            );
-                        }
-                        tma_bar_0.arrive_expect_tx(COMBINED_BYTES);
-                    } else {
-                        unsafe {
-                            cp_async_bulk_tensor_2d_g2s(
-                                &raw mut A1_TILE as *mut u8,
-                                a,
-                                k_offset,
-                                m_offset,
-                                &raw mut TMA_BAR_1,
-                            );
-                            cp_async_bulk_tensor_2d_g2s(
-                                &raw mut B1_TILE as *mut u8,
-                                b,
-                                k_offset,
-                                n_offset,
-                                &raw mut TMA_BAR_1,
-                            );
-                        }
-                        tma_bar_1.arrive_expect_tx(COMBINED_BYTES);
+                    unsafe {
+                        cp_async_bulk_tensor_2d_g2s(
+                            smem_a,
+                            a,
+                            k_offset,
+                            m_offset,
+                            tma_bar.as_ptr() as *mut Barrier,
+                        );
+                        cp_async_bulk_tensor_2d_g2s(
+                            smem_b,
+                            b,
+                            k_offset,
+                            n_offset,
+                            tma_bar.as_ptr() as *mut Barrier,
+                        );
                     }
+                    tma_bar.arrive_expect_tx(COMBINED_BYTES);
                 }
                 k_idx += 1;
             }
@@ -225,37 +219,38 @@ pub mod kernels {
             while k_idx < k_iters {
                 let phase = k_idx & 1;
                 let parity = (k_idx >> 1) & 1;
+                let is_end = k_idx + 1 == k_iters;
+
+                let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
+                    0 => (
+                        &raw mut A0_TILE as u64,
+                        &raw mut B0_TILE as u64,
+                        &mma_bar_0,
+                        &tma_bar_0,
+                    ),
+                    _ => (
+                        &raw mut A1_TILE as u64,
+                        &raw mut B1_TILE as u64,
+                        &mma_bar_1,
+                        &tma_bar_1,
+                    ),
+                };
 
                 // wait for tile memory to be filled
-                if phase == 0 {
-                    while !tma_bar_0.try_wait_parity(parity) {}
-                } else {
-                    while !tma_bar_1.try_wait_parity(parity) {}
-                }
+                while !tma_bar.try_wait_parity(parity) {}
 
                 if lane0 {
-                    let smem_a_ptr = if phase == 0 {
-                        &raw const A0_TILE as u64
-                    } else {
-                        &raw const A1_TILE as u64
-                    };
-                    let smem_b_ptr = if phase == 0 {
-                        &raw const B0_TILE as u64
-                    } else {
-                        &raw const B1_TILE as u64
-                    };
-
                     let mut k_sub = 0;
                     while k_sub < BK as u64 / 16 {
                         let k_offset = (k_sub * 32) as u64;
                         let a_desc = Tcgen05SmemDescriptor::from_bytes(
-                            smem_a_ptr + k_offset,
+                            smem_a + k_offset,
                             LBO_BYTES,
                             SBO_BYTES,
                             Tcgen05SwizzleMode::Swizzle128B,
                         );
                         let b_desc = Tcgen05SmemDescriptor::from_bytes(
-                            smem_b_ptr + k_offset,
+                            smem_b + k_offset,
                             LBO_BYTES,
                             SBO_BYTES,
                             Tcgen05SwizzleMode::Swizzle128B,
@@ -276,14 +271,12 @@ pub mod kernels {
                     }
 
                     unsafe {
-                        if k_idx + 1 == k_iters {
+                        if is_end {
                             tcgen05_commit_shared_cluster(&raw mut COMPUTE_BAR as *mut u64);
-                        } else if phase == 0 {
-                            tcgen05_commit_shared_cluster(&raw mut MMA_BAR_0 as *mut u64);
                         } else {
-                            tcgen05_commit_shared_cluster(&raw mut MMA_BAR_1 as *mut u64);
+                            tcgen05_commit_shared_cluster(mma_bar.as_ptr() as *mut u64);
                         }
-                    };
+                    }
                 }
                 k_idx += 1;
             }
