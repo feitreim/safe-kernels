@@ -130,7 +130,7 @@ pub mod kernels {
             .accumulator_type(Tcgen05AccumulatorType::F32)
             .build();
 
-        // PHASE 1: K-Loop
+        // Stage 1: K-Loop
         let k_iters = (K / BK) as u32;
         let mut k_idx: u32 = 0;
 
@@ -212,7 +212,7 @@ pub mod kernels {
             k_idx += 1;
         }
 
-        // --- Phase 2: TMEM -> Registers -> SMEM ---
+        // --- Stage 2: TMEM -> Registers -> SMEM ---
 
         // each warp loads and then moves to smem
         // TMEM is BM x BN (128 x 128)
@@ -285,7 +285,7 @@ pub mod kernels {
         }
         sync_threads();
 
-        // --- Phase 3: SMEM -> Global ---
+        // --- Stage 3: SMEM -> Global ---
         // Grid is (M / BM, N / BN, 1)
         // Block is (128, 1, 1)
         // SMEM_OUT is BM x BN
@@ -312,7 +312,7 @@ pub mod kernels {
             local_idx += 128;
         }
 
-        // --- Phase 4: Cleanup ---
+        // --- Stage 4: Cleanup ---
         sync_threads();
         // dealloc tmem
         let _dead = unsafe { tmem.dealloc() };
