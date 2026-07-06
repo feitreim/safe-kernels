@@ -28,8 +28,8 @@ use std::mem::MaybeUninit;
 #[cuda_module]
 pub mod kernels {
     use cuda_device::{
-        Barrier, ManagedBarrier, MmaBarrier, SharedArray, TmaBarrier, TmaDescriptor,
-        TmemUninit, Uninit,
+        Barrier, ManagedBarrier, MmaBarrier, SharedArray, TmaBarrier, TmaDescriptor, TmemUninit,
+        Uninit,
         barrier::{
             fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
             mbarrier_init, mbarrier_inval, mbarrier_try_wait,
@@ -37,10 +37,9 @@ pub mod kernels {
         sync_threads,
         tcgen05::{
             Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor,
-            Tcgen05MmaShape, Tcgen05SmemDescriptor,
-            Tcgen05SwizzleMode, TmemGuard, cvt_f32x2_bf16x2, stmatrix_m8n8_x2,
-            tcgen05_commit_shared_cluster, tcgen05_ld_16x256b_pure, tcgen05_load_wait,
-            tcgen05_mma_f16,
+            Tcgen05MmaShape, Tcgen05SmemDescriptor, Tcgen05SwizzleMode, TmemGuard,
+            cvt_f32x2_bf16x2, stmatrix_m8n8_x2, tcgen05_commit_shared_cluster,
+            tcgen05_ld_16x256b_pure, tcgen05_load_wait, tcgen05_mma_f16,
         },
         thread,
         tma::cp_async_bulk_tensor_2d_g2s,
@@ -58,9 +57,14 @@ pub mod kernels {
     pub const BN: usize = 128;
     pub const BK: usize = 64;
 
+    // Warp Specialized Loop:
+    // moving from 4 warps to 6. removing sync_threads.
+    // warps 0-3 do the epilogue
+    // warp 4 exclusively handles TMA
+    // warp 5 exclusively handles MMA
     // Launch dims:
     // grid dim     = (M / BM, N / BN, 1)
-    // block dim    = (128, 1, 1)
+    // block dim    = (192, 1, 1)
     #[kernel]
     pub fn gemm(
         a: *const TmaDescriptor,
@@ -75,14 +79,21 @@ pub mod kernels {
         const A_TILE_BYTES: usize = BM * BK * BF16_SIZE; // * 2 bc f16 is 2x u8
         const B_TILE_BYTES: usize = BK * BN * BF16_SIZE;
         const COMBINED_BYTES: u32 = (A_TILE_BYTES + B_TILE_BYTES) as u32;
-        static mut TILE_A: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
-        static mut TILE_B: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut A0_TILE: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut B0_TILE: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut A1_TILE: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut B1_TILE: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
         const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
-        static mut SMEM_OUT: SharedArray<u32, 8192, 128> = SharedArray::UNINIT;
+        static mut SMEM_OUT: SharedArray<u32, OUTPUT_SIZE, 128> = SharedArray::UNINIT;
         static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
-        static mut TMA_BAR: Barrier = Barrier::UNINIT;
-        static mut MMA_BAR: Barrier = Barrier::UNINIT;
+        static mut TMA_BAR_0: Barrier = Barrier::UNINIT;
+        static mut TMA_BAR_1: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_0: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_1: Barrier = Barrier::UNINIT;
+        static mut COMPUTE_BAR: Barrier = Barrier::UNINIT;
+        const TMA_WARP: u32 = 4;
+        const MMA_WARP: u32 = 5;
 
         // TMA will Swizzle/copy BM/BN x BK f16 tiles from GMEM to SMEM the
         // swizzling is so that the matrices are laid out correctly for MMA.
@@ -95,8 +106,6 @@ pub mod kernels {
         // 8 rows, so the next row of core matrices is 8 x 128b = 1024b.
         const LBO_BYTES: u32 = 16;
         const SBO_BYTES: u32 = 1024;
-        const SWIZZLE_128B: u8 = 2;
-        let swizzle = Tcgen05SwizzleMode::Swizzle128B;
 
         // live info:
         let tid = thread::threadIdx_x();
@@ -110,14 +119,26 @@ pub mod kernels {
         let n_offset = (tile_n as usize * BN) as i32;
 
         // --- Initialize Barriers and TMEM ---
-        let tma_bar = ManagedBarrier::<Uninit, TmaBarrier>::from_static(&raw mut TMA_BAR);
-        let mma_bar = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR);
+        let tma_bar_0 = ManagedBarrier::<Uninit, TmaBarrier>::from_static(&raw mut TMA_BAR_0);
+        let tma_bar_1 = ManagedBarrier::<Uninit, TmaBarrier>::from_static(&raw mut TMA_BAR_1);
+        let mma_bar_0 = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR_0);
+        let mma_bar_1 = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut MMA_BAR_1);
+        let compute_bar = ManagedBarrier::<Uninit, MmaBarrier>::from_static(&raw mut COMPUTE_BAR);
 
-        let tma_bar = unsafe { tma_bar.init(thread::blockDim_x()) };
-        let mma_bar = unsafe { mma_bar.init(1) };
-        let mut tma_token;
+        let tma_bar_0 = unsafe { tma_bar_0.init(1) };
+        let tma_bar_1 = unsafe { tma_bar_1.init(1) };
+        let mma_bar_0 = unsafe { mma_bar_0.init(1) };
+        let mma_bar_1 = unsafe { mma_bar_1.init(1) };
+        let compute_bar = unsafe { compute_bar.init(1) };
         unsafe { fence_proxy_async_shared_cta() };
         thread::sync_threads();
+
+        // pre signal mma bars so they don't stall on the first iter:
+        if thread0 {
+            mma_bar_0.arrive();
+            mma_bar_1.arrive();
+        }
+        sync_threads();
 
         let tmem =
             TmemGuard::<TmemUninit, { BN as u32 }>::from_static(&raw mut TMEM_ADDR as *mut u32);
@@ -130,164 +151,226 @@ pub mod kernels {
             .accumulator_type(Tcgen05AccumulatorType::F32)
             .build();
 
-        // Stage 1: K-Loop
+        // --- Stage 1: K-Loop ---
+        // Warp Specialized Version
+        // Warp 4: TMA Producer loads tiles
+        // Warp 5: MMA Consumer computes tiles
+        // Warp 0-3: Idle
+
         let k_iters = (K / BK) as u32;
-        let mut k_idx: u32 = 0;
 
-        while k_idx < k_iters {
-            let phase = k_idx & 1; // % 2
+        if warp_id == TMA_WARP {
+            let lane0 = warp::lane_id() == 0;
+            let mut k_idx = 0u32;
 
-            // TMA Load
-            // load the whole 128x64 tile at once.
-            if thread0 {
-                let k_base = (k_idx as usize * BK) as i32;
-                unsafe {
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut TILE_A as *mut u8,
-                        a,
-                        k_base,
-                        m_offset,
-                        &raw mut TMA_BAR,
-                    );
-                    cp_async_bulk_tensor_2d_g2s(
-                        &raw mut TILE_B as *mut u8,
-                        b,
-                        k_base,
-                        n_offset,
-                        &raw mut TMA_BAR,
-                    );
+            while k_idx < k_iters {
+                let phase = k_idx & 1;
+                let parity = (k_idx >> 1) & 1;
+
+                // Wait for MMA computation to finish, freeing the tile.
+                if phase == 0 {
+                    while !mma_bar_0.try_wait_parity(parity) {}
+                } else {
+                    while !mma_bar_1.try_wait_parity(parity) {}
                 }
-                tma_token = tma_bar.arrive_expect_tx(COMBINED_BYTES);
-            } else {
-                tma_token = tma_bar.arrive();
+
+                if lane0 {
+                    let k_offset = (k_idx as usize * BK) as i32;
+                    if phase == 0 {
+                        unsafe {
+                            cp_async_bulk_tensor_2d_g2s(
+                                &raw mut A0_TILE as *mut u8,
+                                a,
+                                k_offset,
+                                m_offset,
+                                &raw mut TMA_BAR_0,
+                            );
+                            cp_async_bulk_tensor_2d_g2s(
+                                &raw mut B0_TILE as *mut u8,
+                                b,
+                                k_offset,
+                                n_offset,
+                                &raw mut TMA_BAR_0,
+                            );
+                        }
+                        tma_bar_0.arrive_expect_tx(COMBINED_BYTES);
+                    } else {
+                        unsafe {
+                            cp_async_bulk_tensor_2d_g2s(
+                                &raw mut A1_TILE as *mut u8,
+                                a,
+                                k_offset,
+                                m_offset,
+                                &raw mut TMA_BAR_1,
+                            );
+                            cp_async_bulk_tensor_2d_g2s(
+                                &raw mut B1_TILE as *mut u8,
+                                b,
+                                k_offset,
+                                n_offset,
+                                &raw mut TMA_BAR_1,
+                            );
+                        }
+                        tma_bar_1.arrive_expect_tx(COMBINED_BYTES);
+                    }
+                }
+                k_idx += 1;
             }
+        }
 
-            tma_bar.wait(tma_token);
+        if warp_id == MMA_WARP {
+            let lane0 = warp::lane_id() == 0;
+            let mut k_idx = 0u32;
 
-            // --- MMAs within the Tile ---
-            // each MMA can consume K=16 at a time (two
-            // k groups) LBO = 16, so 2xLBO is 32 bytes, thats the offset
-            // between each K=16
-            if thread0 {
-                let smem_a_ptr = &raw const TILE_A as u64;
-                let smem_b_ptr = &raw const TILE_B as u64;
+            while k_idx < k_iters {
+                let phase = k_idx & 1;
+                let parity = (k_idx >> 1) & 1;
 
-                let mut k_sub = 0;
-                while k_sub < BK as u64 / 16 {
-                    let k_offset = (k_sub * 32) as u64;
-                    let a_desc = Tcgen05SmemDescriptor::from_bytes(
-                        smem_a_ptr + k_offset,
-                        LBO_BYTES,
-                        SBO_BYTES,
-                        swizzle,
-                    );
-                    let b_desc = Tcgen05SmemDescriptor::from_bytes(
-                        smem_b_ptr + k_offset,
-                        LBO_BYTES,
-                        SBO_BYTES,
-                        swizzle,
-                    );
+                // wait for tile memory to be filled
+                if phase == 0 {
+                    while !tma_bar_0.try_wait_parity(parity) {}
+                } else {
+                    while !tma_bar_1.try_wait_parity(parity) {}
+                }
 
-                    // accumulate into d always except for the very first time.
-                    let accumlate = k_idx > 0 || k_sub > 0;
-                    unsafe {
-                        tcgen05_mma_f16(
-                            tmem.address().raw(),
-                            a_desc.raw(),
-                            b_desc.raw(),
-                            mma_desc.raw(),
-                            accumlate,
-                        )
+                if lane0 {
+                    let smem_a_ptr = if phase == 0 {
+                        &raw const A0_TILE as u64
+                    } else {
+                        &raw const A1_TILE as u64
                     };
-                    k_sub += 1;
-                }
+                    let smem_b_ptr = if phase == 0 {
+                        &raw const B0_TILE as u64
+                    } else {
+                        &raw const B1_TILE as u64
+                    };
 
-                unsafe {
-                    tcgen05_commit_shared_cluster(&raw mut MMA_BAR as *mut u64);
+                    let mut k_sub = 0;
+                    while k_sub < BK as u64 / 16 {
+                        let k_offset = (k_sub * 32) as u64;
+                        let a_desc = Tcgen05SmemDescriptor::from_bytes(
+                            smem_a_ptr + k_offset,
+                            LBO_BYTES,
+                            SBO_BYTES,
+                            Tcgen05SwizzleMode::Swizzle128B,
+                        );
+                        let b_desc = Tcgen05SmemDescriptor::from_bytes(
+                            smem_b_ptr + k_offset,
+                            LBO_BYTES,
+                            SBO_BYTES,
+                            Tcgen05SwizzleMode::Swizzle128B,
+                        );
+
+                        // accumulate into d always except for the very first time.
+                        let accumlate = k_idx > 0 || k_sub > 0;
+                        unsafe {
+                            tcgen05_mma_f16(
+                                tmem.address().raw(),
+                                a_desc.raw(),
+                                b_desc.raw(),
+                                mma_desc.raw(),
+                                accumlate,
+                            )
+                        };
+                        k_sub += 1;
+                    }
+
+                    unsafe {
+                        if k_idx + 1 == k_iters {
+                            tcgen05_commit_shared_cluster(&raw mut COMPUTE_BAR as *mut u64);
+                        } else if phase == 0 {
+                            tcgen05_commit_shared_cluster(&raw mut MMA_BAR_0 as *mut u64);
+                        } else {
+                            tcgen05_commit_shared_cluster(&raw mut MMA_BAR_1 as *mut u64);
+                        }
+                    };
                 }
+                k_idx += 1;
             }
-
-            while !mma_bar.try_wait_parity(phase) {} // all threads wait
-            sync_threads();
-            k_idx += 1;
         }
 
         // --- Stage 2: TMEM -> Registers -> SMEM ---
+        if warp_id < 4 {
+            while !compute_bar.try_wait_parity(0u32) {}
+            // first 4 warps loads and then moves to smem
+            // TMEM is BM x BN (128 x 128)
+            // values are f32
+            // tcgen05_ld_16x256b_pure loads 4x f32 per thread
+            // loads 16 rows x 8 columns
+            // so we load 2x matrices with a col offset of 16
+            // when we pass the address its packed (row << 16) | column
+            // so the addr is tmem.address + (tmem_row << 16) | col_offset
+            // lines up exactly with stmatrix_m8n8_x2
+            let warp_row = (warp_id * 32) as usize;
+            let row_stride_bytes = BN * 2;
+            let col_step = 16;
 
-        // each warp loads and then moves to smem
-        // TMEM is BM x BN (128 x 128)
-        // values are f32
-        // tcgen05_ld_16x256b_pure loads 4x f32 per thread
-        // loads 16 rows x 8 columns
-        // so we load 2x matrices with a col offset of 16
-        // when we pass the address its packed (row << 16) | column
-        // so the addr is tmem.address + (tmem_row << 16) | col_offset
-        // lines up exactly with stmatrix_m8n8_x2
-        let warp_row = (warp_id * 32) as usize;
-        let row_stride_bytes = BN * 2;
-        let col_step = 16;
+            // you are probably thinking:
+            // "where did you get these numbers? it feels like they dont make any
+            // sense?"
+            // and you would be correct, instead of each lane actually computing
+            // real addresses, each lane(thread) holds data, but then only lanes
+            // 0-15 provide addresses.
+            // The load command we are using (stmatrix_m8n8_x2) takes 2 8x8
+            // matrices, it is designed to match the output from the tmem loads we
+            // used. with that in mind lanes 0-7 compute the row addresses for the
+            // first matrix, and lanes 8-15 compute the row addresses for the
+            // second.
+            let second_load_offset = 8; // high columns
+            let row_within_8 = (lane_id % 8) as usize;
+            let is_second_matrix = (8..16).contains(&lane_id);
+            let col_offset_for_matrix2 = if is_second_matrix { 16usize } else { 0usize };
 
-        // you are probably thinking:
-        // "where did you get these numbers? it feels like they dont make any
-        // sense?"
-        // and you would be correct, instead of each lane actually computing
-        // real addresses, each lane(thread) holds data, but then only lanes
-        // 0-15 provide addresses.
-        // The load command we are using (stmatrix_m8n8_x2) takes 2 8x8
-        // matrices, it is designed to match the output from the tmem loads we
-        // used. with that in mind lanes 0-7 compute the row addresses for the
-        // first matrix, and lanes 8-15 compute the row addresses for the
-        // second.
-        let second_load_offset = 8; // high columns
-        let row_within_8 = (lane_id % 8) as usize;
-        let is_second_matrix = (8..16).contains(&lane_id);
-        let col_offset_for_matrix2 = if is_second_matrix { 16usize } else { 0usize };
+            let mut tmem_row_offset = 0u32;
+            while tmem_row_offset < 32 {
+                let tmem_row = warp_row as u32 + tmem_row_offset;
 
-        let mut tmem_row_offset = 0u32;
-        while tmem_row_offset < 32 {
-            let tmem_row = warp_row as u32 + tmem_row_offset;
+                let mut col_block = 0u32;
+                while col_block < 8 {
+                    let col_offset = (col_block * col_step) as usize;
+                    unsafe {
+                        let regs_a = tcgen05_ld_16x256b_pure(
+                            tmem.address().raw() + (tmem_row << 16) + col_offset as u32,
+                        );
+                        tcgen05_load_wait();
+                        let regs_b = tcgen05_ld_16x256b_pure(
+                            tmem.address().raw()
+                                + (tmem_row << 16)
+                                + col_offset as u32
+                                + second_load_offset,
+                        );
+                        tcgen05_load_wait();
 
-            let mut col_block = 0u32;
-            while col_block < 8 {
-                let col_offset = (col_block * col_step) as usize;
-                unsafe {
-                    let regs_a = tcgen05_ld_16x256b_pure(
-                        tmem.address().raw() + (tmem_row << 16) + col_offset as u32,
-                    );
-                    tcgen05_load_wait();
-                    let regs_b = tcgen05_ld_16x256b_pure(
-                        tmem.address().raw() + (tmem_row << 16) + col_offset as u32 + second_load_offset,
-                    );
-                    tcgen05_load_wait();
+                        let p0_lo = cvt_f32x2_bf16x2(regs_a.x(), regs_a.y());
+                        let p1_lo = cvt_f32x2_bf16x2(regs_b.x(), regs_b.y());
 
-                    let p0_lo = cvt_f32x2_bf16x2(regs_a.x(), regs_a.y());
-                    let p1_lo = cvt_f32x2_bf16x2(regs_b.x(), regs_b.y());
+                        let out_row_lo = tmem_row as usize + row_within_8;
+                        let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
+                            out_row_lo * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
+                        );
+                        stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
 
-                    let out_row_lo = tmem_row as usize + row_within_8;
-                    let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
-                        out_row_lo * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
-                    );
-                    stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
+                        let p0_hi = cvt_f32x2_bf16x2(regs_a.z(), regs_a.w());
+                        let p1_hi = cvt_f32x2_bf16x2(regs_b.z(), regs_b.w());
+                        let out_row_hi = tmem_row as usize + row_within_8 + 8; // 8 to stagger by extra 8 rows
+                        let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
+                            out_row_hi * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
+                        );
+                        stmatrix_m8n8_x2(smem_addr_hi, p0_hi, p1_hi);
+                    }
 
-                    let p0_hi = cvt_f32x2_bf16x2(regs_a.z(), regs_a.w());
-                    let p1_hi = cvt_f32x2_bf16x2(regs_b.z(), regs_b.w());
-                    let out_row_hi = tmem_row as usize + row_within_8 + 8; // 8 to stagger by extra 8 rows
-                    let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
-                        out_row_hi * row_stride_bytes + col_offset * 2 + col_offset_for_matrix2,
-                    );
-                    stmatrix_m8n8_x2(smem_addr_hi, p0_hi, p1_hi);
+                    col_block += 1;
                 }
 
-                col_block += 1;
+                tmem_row_offset += 16;
             }
-
-            tmem_row_offset += 16;
         }
+
         sync_threads();
 
         // --- Stage 3: SMEM -> Global ---
         // Grid is (M / BM, N / BN, 1)
-        // Block is (128, 1, 1)
+        // Block is (192, 1, 1)
         // SMEM_OUT is BM x BN
         // we are moving packed bf16 as u32, so have 1/2 as many columns
         let width = (N / 2) as usize;
@@ -309,17 +392,21 @@ pub mod kernels {
             unsafe {
                 *c.get_unchecked_mut(global_idx) = SMEM_OUT[local_idx];
             }
-            local_idx += 128;
+            local_idx += 192;
         }
 
         // --- Stage 4: Cleanup ---
         sync_threads();
-        // dealloc tmem
-        let _dead = unsafe { tmem.dealloc() };
-        let _tma_bar = unsafe { tma_bar.inval() };
-        let _mma_bar = unsafe { mma_bar.inval() };
+        unsafe {
+            // dealloc tmem
+            let _dead = tmem.dealloc();
+            let _tma_bar0 = tma_bar_0.inval();
+            let _tma_bar1 = tma_bar_1.inval();
+            let _mma_bar0 = mma_bar_0.inval();
+            let _mma_bar1 = mma_bar_1.inval();
+            let _compute_bar = compute_bar.inval();
+        }
     }
-
 
     // Launch dims:
     // grid dim     = (M / BM, N / BN, 1)
@@ -342,7 +429,7 @@ pub mod kernels {
         static mut TILE_B: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
         const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
-        static mut SMEM_OUT: SharedArray<u32, 8192, 128> = SharedArray::UNINIT;
+        static mut SMEM_OUT: SharedArray<u32, OUTPUT_SIZE, 128> = SharedArray::UNINIT;
         static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
         static mut TMA_BAR: Barrier = Barrier::UNINIT;
         static mut MMA_BAR: Barrier = Barrier::UNINIT;
@@ -358,7 +445,6 @@ pub mod kernels {
         // 8 rows, so the next row of core matrices is 8 x 128b = 1024b.
         const LBO_BYTES: u32 = 16;
         const SBO_BYTES: u32 = 1024;
-        const SWIZZLE_128B: u8 = 2;
         let swizzle = Tcgen05SwizzleMode::Swizzle128B;
 
         // live info:
@@ -519,7 +605,10 @@ pub mod kernels {
                     );
                     tcgen05_load_wait();
                     let regs_b = tcgen05_ld_16x256b_pure(
-                        tmem.address().raw() + (tmem_row << 16) + col_offset as u32 + second_load_offset,
+                        tmem.address().raw()
+                            + (tmem_row << 16)
+                            + col_offset as u32
+                            + second_load_offset,
                     );
                     tcgen05_load_wait();
 
@@ -1112,12 +1201,13 @@ pub fn create_tma_descriptor_f32(
     Ok(unsafe { tensor_map.assume_init() })
 }
 
-/// One CTA per BM×BN output tile, 128 threads (4 warps) per CTA:
+/// One CTA per BM×BN output tile, 192 threads (6 warps) per CTA:
 /// blockIdx.x walks the M/BM row tiles, blockIdx.y the N/BN column tiles.
 fn launch() -> LaunchConfig {
     LaunchConfig {
         grid_dim: ((M / BM) as u32, (N / BN) as u32, 1),
-        block_dim: (128, 1, 1),
+        // 6 warps: 0-3 epilogue, 4 TMA producer, 5 MMA consumer.
+        block_dim: (192, 1, 1),
         shared_mem_bytes: 0,
     }
 }
@@ -1201,6 +1291,8 @@ pub fn matmul(
 
 // BENCHMARKS:
 // -- GPU (B200), 8192×8192×8192, bench_all (same shape/data, fair ladder):
+// TCGEN05 v3 WARP SPECIALIZED  2.1693 ms   506.8 TFLOPs    (36% of ~1400 bf16 SoL)
+// TCGEN05 v2 PIPELINE          3.7748 ms   291.3 TFLOPs
 // TCGEN05 v1                   4.0277 ms   273.0 TFLOPs    (19.5% of ~1400 bf16 SoL)
 // TMA PIPELINE(=2)             23.0041 ms  47.8 TFLOPs
 // REGISTER TILES (B=16,T=8):   36.9776 ms  29.7 TFLOPs
