@@ -8,6 +8,7 @@ Local usage (see also ./run.sh):
     modal run modal_app.py --kernel vecadd               # correctness (main.rs)
     modal run modal_app.py --kernel vecadd --bin bench   # benchmark (src/bin/bench.rs)
     modal run modal_app.py --kernel vecadd --gpu A100    # pick a GPU
+    modal run modal_app.py --kernel gemm --sanitize synccheck   # compute-sanitizer
     modal run modal_app.py::doctor                        # env / GPU sanity check
 """
 
@@ -184,6 +185,38 @@ def run_sweep(kernel: str, configs: str) -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
+def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -> None:
+    """Run a kernel binary under compute-sanitizer (memcheck / racecheck /
+    synccheck / initcheck).
+
+    `cargo oxide run` builds and launches in one step, so to interpose the
+    sanitizer we build first, then find the host binary under target/ and
+    launch it ourselves.
+    """
+    import os
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    proj = f"{PROJECT_DIR}/kernels/{kernel}"
+    if not os.path.isdir(proj):
+        raise SystemExit(f"no kernel project at kernels/{kernel}")
+    # `cargo oxide build` has no --bin flag, so this builds every bin target.
+    # Kernels mixing tagged and untagged cuda-oxide git deps fail here even if
+    # the bin we want would build; align the pins in Cargo.toml if that bites.
+    name = bin or kernel
+    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    candidates = []
+    for root, _, files in os.walk(f"{proj}/target"):
+        for f in files:
+            path = os.path.join(root, f)
+            if f == name and os.access(path, os.X_OK):
+                candidates.append(path)
+    if not candidates:
+        raise SystemExit(f"no built binary named {name} under kernels/{kernel}/target")
+    binary = max(candidates, key=os.path.getmtime)
+    _run(["compute-sanitizer", "--tool", tool, binary], cwd=proj)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
 def dump_ptx(kernel: str) -> str:
     import os
 
@@ -212,7 +245,12 @@ def main(
     thrust: bool = False,
     ptx: bool = False,
     sweep: str = "",
+    sanitize: str = "",
 ) -> None:
+    if sanitize:
+        fn = run_sanitizer.with_options(gpu=gpu) if gpu else run_sanitizer
+        fn.remote(kernel, bin or None, sanitize)
+        return
     if thrust:
         fn = run_thrust.with_options(gpu=gpu) if gpu else run_thrust
         fn.remote(kernel)

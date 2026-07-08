@@ -6,6 +6,7 @@
 #   ./run.sh vecadd bench    # vecadd throughput benchmark
 #   ./run.sh vecsum thrust   # Thrust/CUB reduce baseline (kernels/<k>/baselines)
 #   GPU=A100 ./run.sh vecadd bench   # pick a GPU
+#   SANITIZE=synccheck ./run.sh gemm # compute-sanitizer (memcheck/racecheck/synccheck/initcheck)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,5 +20,6 @@ elif [[ -n "$bin" ]]; then
   args+=(--bin "$bin")
 fi
 [[ -n "${GPU:-}" ]] && args+=(--gpu "$GPU")
+[[ -n "${SANITIZE:-}" ]] && args+=(--sanitize "$SANITIZE")
 
 exec modal run modal_app.py "${args[@]}"

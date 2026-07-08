@@ -3,7 +3,7 @@
 //! Times the `gemm` kernel (defined once in `src/lib.rs`, shared with `main.rs`)
 //! with CUDA events (device-side timing, not wall clock): WARMUP launches to
 //! settle clocks/caches, then ITERS launches measured between two recorded
-//! events. GEMM is compute-bound, so the figure of merit is GFLOP/s.
+//! events. GEMM is compute-bound, so the figure of merit is TFLOP/s.
 //!
 //! Run on a GPU (via Modal):  ./run.sh gemm bench
 
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2·M·N·K flops: one multiply + one add per contraction term.
     let flops = 2.0 * M as f64 * N as f64 * K as f64;
-    let gflops = flops / secs / 1.0e9;
+    let tflops = flops / secs / 1.0e12;
 
     // Algorithmic-minimum traffic: read A and B once each, write C once. A
     // kernel with no data reuse actually pulls far more from DRAM (the naive
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gbs = bytes / secs / 1.0e9;
 
     println!(
-        "gemm  {M}×{N}×{K}  avg={avg_ms:.4} ms  {gflops:.1} GFLOP/s  {gbs:.1} GB/s (min traffic)"
+        "gemm  {M}×{N}×{K}  avg={avg_ms:.4} ms  {tflops:.1} TFLOP/s  {gbs:.1} GB/s (min traffic)"
     );
 
     // Copy one result down so a broken launch surfaces here rather than silently.

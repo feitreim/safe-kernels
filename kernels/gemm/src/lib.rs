@@ -34,7 +34,8 @@ pub mod kernels {
             fence_proxy_async_shared_cta, mbarrier_arrive, mbarrier_arrive_expect_tx,
             mbarrier_init, mbarrier_inval, mbarrier_try_wait,
         },
-        sync_threads,
+        clc::{clc_query_get_first_ctaid_x, clc_query_is_canceled, clc_try_cancel},
+        cluster_launch, sync_threads,
         tcgen05::{
             Tcgen05AccumulatorType, Tcgen05ElementType, Tcgen05InstructionDescriptor,
             Tcgen05MmaShape, Tcgen05SmemDescriptor, Tcgen05SwizzleMode, TmemGuard,
@@ -57,6 +58,578 @@ pub mod kernels {
     pub const BN: usize = 128;
     pub const BK: usize = 64;
 
+    // CLC tile scheduling (work stealing) + TMEM accumulator pipeline.
+    // warp 4 exclusively handles TMA
+    // warp 5 exclusively handles MMA
+    // the GPU creates a total_tiles length queue with blocks of 4 CTAs (cluster dim)
+    // CTA flow:
+    // 1. Process own tile
+    //
+    // 2. steal a cluster
+    // lane 0: arm + issue `clc_try_cancel`
+    // then wait/decode answer, then shuffle the result across the warp.
+    //
+    // 3. process the 4 stolen tiles serially
+    //
+    // 4. repeat until canceled.
+    //
+    // tile m,n are linear assigned COLUMN major from C.
+    // tile_m = blockIdx_x % TILES_M
+    // tile_n = blockIdx_x / TILES_M
+    // This means that consecutive cta_IDs are adjacent in (the row-major) memory.
+    //
+    // Launch dims:
+    // grid dim     = (total_tiles, 1, 1)
+    // cluster dim  = (4, 1, 1)
+    // block dim    = (192, 1, 1)
+    #[kernel]
+    #[cluster_launch(4, 1, 1)]
+    pub fn gemm(
+        a: *const TmaDescriptor,
+        b: *const TmaDescriptor, // reminder, B should be transposed to be NxK first
+        mut c: DisjointSlice<u32>,
+    ) {
+        // SMEM tiles contain f16/bf16 and are shape:
+        // A: BM x BK
+        // B: BK x BN
+        // MMA instructions process MMA_K=16 at a time, so we have BK/MMA_K (4) MMA instructions
+        const BF16_SIZE: usize = 2;
+        const A_TILE_BYTES: usize = BM * BK * BF16_SIZE; // * 2 bc f16 is 2x u8
+        const B_TILE_BYTES: usize = BK * BN * BF16_SIZE;
+        const COMBINED_BYTES: u32 = (A_TILE_BYTES + B_TILE_BYTES) as u32;
+        const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
+        const CLUSTER_SIZE: u32 = 4;
+        const TILES_M: u32 = (M / BM) as u32;
+        const NUM_ACCUM_STAGES: u32 = 2;
+
+        // setup smem
+        static mut SMEM_A0: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_B0: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_A1: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_B1: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_OUT: SharedArray<u32, OUTPUT_SIZE, 128> = SharedArray::UNINIT;
+        static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
+        // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
+
+        // TMA/MMA double buffered
+        static mut TMA_BAR_0: Barrier = Barrier::UNINIT;
+        static mut TMA_BAR_1: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_0: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_1: Barrier = Barrier::UNINIT;
+
+        // TMEM accumulator pipelining
+        static mut ACCUM_FULL_0: Barrier = Barrier::UNINIT;
+        static mut ACCUM_FULL_1: Barrier = Barrier::UNINIT;
+        static mut ACCUM_EMPTY_0: Barrier = Barrier::UNINIT;
+        static mut ACCUM_EMPTY_1: Barrier = Barrier::UNINIT;
+        static mut TILE_READY: Barrier = Barrier::UNINIT;
+
+        // CLC (workstealing) response buffer and barrier
+        static mut TILE_INFO: SharedArray<u32, 4, 4> = SharedArray::UNINIT;
+        static mut CLC_RESPONSE: SharedArray<u64, 2, 16> = SharedArray::UNINIT;
+        static mut CLC_BAR: Barrier = Barrier::UNINIT;
+        // tile info layout:
+        // +0 : tile_m
+        // +1 : tile_n
+        // +2 : 0 = finished, 1 = working
+
+        const SBO_BYTES: u32 = 1024;
+        const LBO_BYTES: u32 = 16;
+        const TMA_WARP: u32 = 4;
+        const MMA_WARP: u32 = 5;
+
+        // live info:
+        let tid = thread::threadIdx_x();
+        let warp_id = warp::warp_id();
+        let lane_id = tid % 32;
+        let thread0 = tid == 0;
+
+        // --- Stage 0: Initialize Barriers and TMEM ---
+        let tma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_0);
+        let tma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_1);
+        let mma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_0);
+        let mma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_1);
+        let accum_full_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_0);
+        let accum_full_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_1);
+        let accum_empty_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_EMPTY_0);
+        let accum_empty_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_EMPTY_1);
+        let tile_bar = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TILE_READY);
+        let clc_bar = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut CLC_BAR);
+
+        let tma_bar_0 = unsafe { tma_bar_0.init(1) };
+        let tma_bar_1 = unsafe { tma_bar_1.init(1) };
+        let mma_bar_0 = unsafe { mma_bar_0.init(1) };
+        let mma_bar_1 = unsafe { mma_bar_1.init(1) };
+        let accum_full_0 = unsafe { accum_full_0.init(1) };
+        let accum_full_1 = unsafe { accum_full_1.init(1) };
+        let accum_empty_0 = unsafe { accum_empty_0.init(128) }; // number of epilogue threads
+        let accum_empty_1 = unsafe { accum_empty_1.init(128) };
+        let tile_bar = unsafe { tile_bar.init(1) };
+        let clc_bar = unsafe { clc_bar.init(1) };
+
+        let tmem = TmemGuard::<TmemUninit, { BN as u32 * NUM_ACCUM_STAGES}>::from_static(
+            &raw mut TMEM_ADDR as *mut u32,
+        );
+        let tmem = unsafe { tmem.alloc() };
+        thread::sync_threads();
+
+        let mma_desc = Tcgen05InstructionDescriptor::builder()
+            .shape(Tcgen05MmaShape::M128_N128)
+            .element_type(Tcgen05ElementType::BF16)
+            .accumulator_type(Tcgen05AccumulatorType::F32)
+            .build();
+
+        // pre signal mma bars so they don't stall on the first iter:
+        if thread0 {
+            mma_bar_0.arrive();
+            mma_bar_1.arrive();
+        }
+        sync_threads();
+
+        // --- Stage 1: K-Loop ---
+        // Warp Specialized Version
+        // Warp 4: TMA Producer loads tiles
+        // Warp 5: MMA Consumer computes tiles
+        // Warp 0-3: Idle
+        let k_iters = (K / BK) as u32;
+
+        if warp_id == TMA_WARP {
+            let is_lane0 = warp::lane_id() == 0;
+            let mut global_k: u32 = 0;
+            let mut clc_iter: u32 = 0;
+
+            // consume the starter tile first:
+            let first_ctaid = thread::blockIdx_x();
+            let first_tile_m = first_ctaid % TILES_M;
+            let first_tile_n = first_ctaid / TILES_M;
+
+            if is_lane0 {
+                unsafe {
+                    *(&raw mut TILE_INFO as *mut u32).add(0) = first_tile_m;
+                    *(&raw mut TILE_INFO as *mut u32).add(1) = first_tile_n;
+                    *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
+                }
+                tile_bar.arrive();
+            }
+
+            let m_offset = (first_tile_m * BM as u32) as i32;
+            let n_offset = (first_tile_n * BN as u32) as i32;
+
+            let mut k_idx = 0u32;
+            while k_idx < k_iters {
+                let phase = global_k & 1;
+                let parity = (global_k >> 1) & 1;
+
+                let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
+                    0 => (
+                        &raw mut SMEM_A0 as *mut u8,
+                        &raw mut SMEM_B0 as *mut u8,
+                        &mma_bar_0,
+                        &tma_bar_0,
+                    ),
+                    _ => (
+                        &raw mut SMEM_A1 as *mut u8,
+                        &raw mut SMEM_B1 as *mut u8,
+                        &mma_bar_1,
+                        &tma_bar_1,
+                    ),
+                };
+
+                // Wait for MMA computation to finish, freeing the tile.
+                while !mma_bar.try_wait_parity(parity) {}
+
+                if is_lane0 {
+                    let k_offset = (k_idx as usize * BK) as i32;
+                    unsafe {
+                        cp_async_bulk_tensor_2d_g2s(
+                            smem_a,
+                            a,
+                            k_offset,
+                            m_offset,
+                            tma_bar.as_ptr() as *mut Barrier,
+                        );
+                        cp_async_bulk_tensor_2d_g2s(
+                            smem_b,
+                            b,
+                            k_offset,
+                            n_offset,
+                            tma_bar.as_ptr() as *mut Barrier,
+                        );
+                    }
+                    tma_bar.arrive_expect_tx(COMBINED_BYTES);
+                }
+                k_idx += 1;
+                global_k += 1;
+            }
+
+            let clc_ptr = &raw mut CLC_RESPONSE as *mut u8;
+
+            loop {
+                let clc_parity = clc_iter & 1;
+
+                // keep response logic in lane 0.
+                let mut is_canceled = 0u32;
+                let mut first_stolen = 0u32;
+                if is_lane0 {
+                    unsafe {
+                        fence_proxy_async_shared_cta();
+                        clc_bar.arrive_expect_tx(16); // CLC response size is 16 bytes
+                        clc_try_cancel(clc_ptr, &raw mut CLC_BAR);
+
+                        // wait on clc barrier
+                        while !clc_bar.try_wait_parity(clc_parity) {}
+                        let resp_lo = CLC_RESPONSE[0];
+                        let resp_hi = CLC_RESPONSE[1];
+
+                        is_canceled = clc_query_is_canceled(resp_lo, resp_hi);
+                        if is_canceled != 0 {
+                            first_stolen = clc_query_get_first_ctaid_x(resp_lo, resp_hi);
+                        }
+                        fence_proxy_async_shared_cta();
+                    }
+                }
+
+                is_canceled = warp::shuffle(is_canceled, 0);
+                first_stolen = warp::shuffle(first_stolen, 0);
+
+                // bail if canceled
+                if is_canceled == 0 {
+                    if is_lane0 {
+                        // update TILE_INFO with cancellation
+                        unsafe {
+                            *(&raw mut TILE_INFO as *mut u32).add(2) = 0;
+                        }
+                        tile_bar.arrive();
+                    }
+                    break;
+                }
+
+                let mut cluster_step = 0u32;
+                while cluster_step < CLUSTER_SIZE {
+                    let ctaid = first_stolen + cluster_step;
+                    let tile_m = ctaid % TILES_M;
+                    let tile_n = ctaid / TILES_M;
+
+                    if is_lane0 {
+                        unsafe {
+                            *(&raw mut TILE_INFO as *mut u32).add(0) = tile_m;
+                            *(&raw mut TILE_INFO as *mut u32).add(1) = tile_n;
+                            *(&raw mut TILE_INFO as *mut u32).add(2) = 1;
+                        }
+                        tile_bar.arrive();
+                    }
+
+                    let m_offset = (tile_m * BM as u32) as i32;
+                    let n_offset = (tile_n * BN as u32) as i32;
+
+                    let mut k_idx = 0u32;
+                    while k_idx < k_iters {
+                        let phase = global_k & 1;
+                        let parity = (global_k >> 1) & 1;
+
+                        let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
+                            0 => (
+                                &raw mut SMEM_A0 as *mut u8,
+                                &raw mut SMEM_B0 as *mut u8,
+                                &mma_bar_0,
+                                &tma_bar_0,
+                            ),
+                            _ => (
+                                &raw mut SMEM_A1 as *mut u8,
+                                &raw mut SMEM_B1 as *mut u8,
+                                &mma_bar_1,
+                                &tma_bar_1,
+                            ),
+                        };
+
+                        // Wait for MMA computation to finish, freeing the tile.
+                        while !mma_bar.try_wait_parity(parity) {}
+
+                        if is_lane0 {
+                            let k_offset = (k_idx as usize * BK) as i32;
+                            unsafe {
+                                cp_async_bulk_tensor_2d_g2s(
+                                    smem_a,
+                                    a,
+                                    k_offset,
+                                    m_offset,
+                                    tma_bar.as_ptr() as *mut Barrier,
+                                );
+                                cp_async_bulk_tensor_2d_g2s(
+                                    smem_b,
+                                    b,
+                                    k_offset,
+                                    n_offset,
+                                    tma_bar.as_ptr() as *mut Barrier,
+                                );
+                            }
+                            tma_bar.arrive_expect_tx(COMBINED_BYTES);
+                        }
+                        k_idx += 1;
+                        global_k += 1;
+                    }
+                    cluster_step += 1;
+                }
+                clc_iter += 1;
+            }
+        }
+
+        if warp_id == MMA_WARP {
+            let is_lane0 = lane_id == 0;
+            let mut tile_iter = 0u32;
+            let mut tile_parity = 0u32;
+            let mut global_k = 0u32;
+
+            loop {
+                while !tile_bar.try_wait_parity(tile_parity) {}
+                tile_parity ^= 1;
+
+                let has_work = unsafe { *(&raw const TILE_INFO as *const u32).add(2) };
+                if has_work == 0 {
+                    break;
+                }
+
+                let accum_stage = tile_iter % NUM_ACCUM_STAGES;
+                let tmem_stage_offset = accum_stage * BN as u32;
+                let (accum_empty, accum_full) = match accum_stage {
+                    0 => (&accum_empty_0, &accum_full_0),
+                    _ => (&accum_empty_1, &accum_full_1),
+                };
+
+                if tile_iter >= NUM_ACCUM_STAGES {
+                    let empty_parity = ((tile_iter - NUM_ACCUM_STAGES) / NUM_ACCUM_STAGES) & 1;
+                    while !accum_empty.try_wait_parity(empty_parity) {}
+                }
+
+                let mut k_idx = 0u32;
+                while k_idx < k_iters {
+                    let phase = global_k & 1;
+                    let parity = (global_k >> 1) & 1;
+
+                    let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
+                        0 => (
+                            &raw mut SMEM_A0 as u64,
+                            &raw mut SMEM_B0 as u64,
+                            &mma_bar_0,
+                            &tma_bar_0,
+                        ),
+                        _ => (
+                            &raw mut SMEM_A1 as u64,
+                            &raw mut SMEM_B1 as u64,
+                            &mma_bar_1,
+                            &tma_bar_1,
+                        ),
+                    };
+
+                    // wait for tile memory to be filled
+                    while !tma_bar.try_wait_parity(parity) {}
+
+                    if is_lane0 {
+                        let mut k_sub = 0;
+                        while k_sub < BK as u64 / 16 {
+                            let k_offset = (k_sub * 32) as u64;
+                            let a_desc = Tcgen05SmemDescriptor::from_bytes(
+                                smem_a + k_offset,
+                                LBO_BYTES,
+                                SBO_BYTES,
+                                Tcgen05SwizzleMode::Swizzle128B,
+                            );
+                            let b_desc = Tcgen05SmemDescriptor::from_bytes(
+                                smem_b + k_offset,
+                                LBO_BYTES,
+                                SBO_BYTES,
+                                Tcgen05SwizzleMode::Swizzle128B,
+                            );
+
+                            // accumulate into d always except for the very first time.
+                            let accumlate = k_idx > 0 || k_sub > 0;
+                            unsafe {
+                                tcgen05_mma_f16(
+                                    tmem.address().raw() + tmem_stage_offset,
+                                    a_desc.raw(),
+                                    b_desc.raw(),
+                                    mma_desc.raw(),
+                                    accumlate,
+                                )
+                            };
+                            k_sub += 1;
+                        }
+
+                        unsafe {
+                            tcgen05_commit_shared_cluster(mma_bar.as_ptr() as *mut u64);
+                        }
+                    }
+                    k_idx += 1;
+                    global_k += 1;
+                }
+
+                if is_lane0 {
+                    unsafe {
+                        tcgen05_commit_shared_cluster(accum_full.as_ptr() as *mut u64);
+                    }
+                }
+
+                tile_iter += 1;
+            }
+        }
+
+        // --- Stage 2: TMEM -> Registers -> SMEM ---
+        // Now two phases, for each accumulator.
+        if warp_id < 4 {
+            let mut epilogue_tile_iter = 0u32;
+            let mut tile_parity = 0u32;
+            // TMEM is BM x BN (128 x 128)
+            // values are f32
+            // tcgen05_ld_16x256b_pure loads 4x f32 per thread
+            // loads 16 rows x 8 columns
+            // so we load 2x matrices with a col offset of 16
+            // when we pass the address its packed (row << 16) | column
+            // so the addr is tmem.address + (tmem_row << 16) | col_offset
+            // lines up exactly with stmatrix_m8n8_x2
+            // The load command we are using (stmatrix_m8n8_x2) takes 2 8x8
+            // matrices, it is designed to match the output from the tmem loads we
+            // used. with that in mind, lanes 0-7 compute the row addresses for the
+            // first matrix, and lanes 8-15 compute the row addresses for the
+            // second.
+            let warp_row = (warp_id * 32) as usize;
+            let row_stride_bytes = BN * 2;
+            let col_step = 16;
+            let second_load_offset = 8; // high columns
+            let row_within_8 = (lane_id % 8) as usize;
+            let is_second_matrix = (8..16).contains(&lane_id);
+            let col_offset_for_matrix2 = if is_second_matrix { 16usize } else { 0usize };
+
+            loop {
+                while !tile_bar.try_wait_parity(tile_parity) {}
+                tile_parity ^= 1;
+
+                let info_ptr = &raw const TILE_INFO as *const u32;
+                let has_work = unsafe { *info_ptr.add(2) };
+                if has_work == 0 {
+                    break;
+                }
+
+                // Tile to clear!
+                let tile_m = unsafe { *info_ptr.add(0) };
+                let tile_n = unsafe { *info_ptr.add(1) };
+
+                let accum_stage = epilogue_tile_iter % NUM_ACCUM_STAGES;
+
+                let (full_bar, empty_bar, tmem_stage_offset) = match accum_stage {
+                    0 => (&accum_full_0, &accum_empty_0, 0u32),
+                    _ => (&accum_full_1, &accum_empty_1, BN as u32),
+                };
+
+                let full_parity = (epilogue_tile_iter / NUM_ACCUM_STAGES) & 1;
+
+                while !full_bar.try_wait_parity(full_parity) {}
+
+                let mut tmem_row_offset = 0u32;
+                while tmem_row_offset < 32 {
+                    let tmem_row = warp_row as u32 + tmem_row_offset;
+
+                    let mut col_block = 0u32;
+                    while col_block < 8 {
+                        let col_offset = (col_block * col_step) as usize;
+                        unsafe {
+                            let regs_a = tcgen05_ld_16x256b_pure(
+                                tmem.address().raw()
+                                + tmem_stage_offset
+                                    + (tmem_row << 16)
+                                    + col_offset as u32,
+                            );
+                            tcgen05_load_wait();
+
+                            let regs_b = tcgen05_ld_16x256b_pure(
+                                tmem.address().raw()
+                                + tmem_stage_offset
+                                    + (tmem_row << 16)
+                                    + col_offset as u32
+                                    + second_load_offset,
+                            );
+                            tcgen05_load_wait();
+
+                            let p0_lo = cvt_f32x2_bf16x2(regs_a.x(), regs_a.y());
+                            let p1_lo = cvt_f32x2_bf16x2(regs_b.x(), regs_b.y());
+
+                            let out_row_lo = tmem_row as usize + row_within_8;
+                            let smem_addr_lo = (&raw mut SMEM_OUT as *mut u8).add(
+                                out_row_lo * row_stride_bytes
+                                    + col_offset * 2
+                                    + col_offset_for_matrix2,
+                            );
+                            stmatrix_m8n8_x2(smem_addr_lo, p0_lo, p1_lo);
+
+                            let p0_hi = cvt_f32x2_bf16x2(regs_a.z(), regs_a.w());
+                            let p1_hi = cvt_f32x2_bf16x2(regs_b.z(), regs_b.w());
+                            let out_row_hi = tmem_row as usize + row_within_8 + 8; // 8 to stagger by extra 8 rows
+                            let smem_addr_hi = (&raw mut SMEM_OUT as *mut u8).add(
+                                out_row_hi * row_stride_bytes
+                                    + col_offset * 2
+                                    + col_offset_for_matrix2,
+                            );
+                            stmatrix_m8n8_x2(smem_addr_hi, p0_hi, p1_hi);
+                        }
+
+                        col_block += 1;
+                    }
+
+                    tmem_row_offset += 16;
+                }
+
+                // --- Stage 3: SMEM -> Global ---
+                // Grid is (M / BM, N / BN, 1)
+                // Block is (192, 1, 1)
+                // SMEM_OUT is BM x BN
+                // we are moving packed bf16 as u32, so have 1/2 as many columns
+                const PER_WARP_BOUNDS: usize = BM * (BN / 2) / 4;
+                const WIDTH: usize = (N / 2) as usize;
+                const TILE_WIDTH: usize = BN / 2;
+                let tile_row_base = tile_m as usize * BM;
+                let tile_col_base = tile_n as usize * (BN / 2);
+                let base_row = warp_id as usize * 32;
+
+                // interate over the SMEM out linearly for coalesced loads
+                let mut local_idx = lane_id as usize;
+                while local_idx < PER_WARP_BOUNDS {
+                    let local_row = local_idx / TILE_WIDTH;
+                    let local_col = local_idx % TILE_WIDTH;
+                    let smem_idx = (base_row + local_row) * 64 + local_col;
+
+                    let global_row = tile_row_base + base_row + local_row;
+                    let global_col = tile_col_base + local_col;
+                    let global_idx = global_row * WIDTH + global_col;
+
+                    unsafe {
+                        *c.get_unchecked_mut(global_idx) = SMEM_OUT[smem_idx];
+                    }
+                    local_idx += 32;
+                }
+
+                empty_bar.arrive();
+                epilogue_tile_iter += 1;
+            }
+        }
+
+        // --- Stage 4: Cleanup ---
+        sync_threads();
+        unsafe {
+            // dealloc tmem
+            let _dead = tmem.dealloc();
+            // dealloc barriers
+            let _tma_bar_0 = tma_bar_0.inval();
+            let _tma_bar_1 = tma_bar_1.inval();
+            let _mma_bar_0 = mma_bar_0.inval();
+            let _mma_bar_1 = mma_bar_1.inval();
+            let _accum_full_0 = accum_full_0.inval();
+            let _accum_full_1 = accum_full_1.inval();
+            let _accum_empty_0 = accum_empty_0.inval();
+            let _accum_empty_1 = accum_empty_1.inval();
+            let _tile_bar = tile_bar.inval();
+            let _clc_bar = clc_bar.inval();
+        }
+    }
+
     // Warp Specialized Loop:
     // moving from 4 warps to 6. removing sync_threads.
     // warps 0-3 do the epilogue
@@ -66,7 +639,7 @@ pub mod kernels {
     // grid dim     = (M / BM, N / BN, 1)
     // block dim    = (192, 1, 1)
     #[kernel]
-    pub fn gemm(
+    pub fn gemm_warp_specialized(
         a: *const TmaDescriptor,
         b: *const TmaDescriptor, // reminder, B should be transposed to be NxK first
         mut c: DisjointSlice<u32>,
@@ -1194,11 +1767,15 @@ pub fn create_tma_descriptor_f32(
     Ok(unsafe { tensor_map.assume_init() })
 }
 
-/// One CTA per BM×BN output tile, 192 threads (6 warps) per CTA:
-/// blockIdx.x walks the M/BM row tiles, blockIdx.y the N/BN column tiles.
+/// One CTA per BM×BN output tile, 192 threads (6 warps) per CTA. The CLC
+/// kernel wants a *linear* grid — it decodes tile_m = ctaid % TILES_M,
+/// tile_n = ctaid / TILES_M (column major) and steals work in blocks of 4
+/// consecutive ctaids, matching its `#[cluster_launch(4, 1, 1)]`. The
+/// generated host stub applies the cluster dims itself, so only the grid
+/// shape lives here.
 fn launch() -> LaunchConfig {
     LaunchConfig {
-        grid_dim: ((M / BM) as u32, (N / BN) as u32, 1),
+        grid_dim: (((M / BM) * (N / BN)) as u32, 1, 1),
         // 6 warps: 0-3 epilogue, 4 TMA producer, 5 MMA consumer.
         block_dim: (192, 1, 1),
         shared_mem_bytes: 0,
@@ -1284,6 +1861,8 @@ pub fn matmul(
 
 // BENCHMARKS:
 // -- GPU (B200), 8192×8192×8192, bench_all (same shape/data, fair ladder):
+//
+// WORK STEALING (WAVES=2)      2.2133 ms   496.8 TFLOPs
 // TCGEN05 v3 WARP SPECIALIZED  2.1693 ms   506.8 TFLOPs    (36% of ~1400 bf16 SoL)
 // TCGEN05 v2 PIPELINE          3.7748 ms   291.3 TFLOPs
 // TCGEN05 v1                   4.0277 ms   273.0 TFLOPs    (19.5% of ~1400 bf16 SoL)
