@@ -100,13 +100,18 @@ pub mod kernels {
         const OUTPUT_SIZE: usize = BM * BN / BF16_SIZE;
         const CLUSTER_SIZE: u32 = 4;
         const TILES_M: u32 = (M / BM) as u32;
+        const STAGES: u32 = 4;
         const NUM_ACCUM_STAGES: u32 = 2;
 
         // setup smem
         static mut SMEM_A0: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
-        static mut SMEM_B0: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut SMEM_A1: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_A2: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_A3: SharedArray<u8, A_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_B0: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut SMEM_B1: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_B2: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
+        static mut SMEM_B3: SharedArray<u8, B_TILE_BYTES, 128> = SharedArray::UNINIT;
         static mut SMEM_OUT: SharedArray<u32, OUTPUT_SIZE, 128> = SharedArray::UNINIT;
         static mut TMEM_ADDR: SharedArray<u32, 1, 4> = SharedArray::UNINIT;
         // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
@@ -114,8 +119,12 @@ pub mod kernels {
         // TMA/MMA double buffered
         static mut TMA_BAR_0: Barrier = Barrier::UNINIT;
         static mut TMA_BAR_1: Barrier = Barrier::UNINIT;
+        static mut TMA_BAR_2: Barrier = Barrier::UNINIT;
+        static mut TMA_BAR_3: Barrier = Barrier::UNINIT;
         static mut MMA_BAR_0: Barrier = Barrier::UNINIT;
         static mut MMA_BAR_1: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_2: Barrier = Barrier::UNINIT;
+        static mut MMA_BAR_3: Barrier = Barrier::UNINIT;
 
         // TMEM accumulator pipelining
         static mut ACCUM_FULL_0: Barrier = Barrier::UNINIT;
@@ -147,8 +156,12 @@ pub mod kernels {
         // --- Stage 0: Initialize Barriers and TMEM ---
         let tma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_0);
         let tma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_1);
+        let tma_bar_2 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_2);
+        let tma_bar_3 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_3);
         let mma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_0);
         let mma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_1);
+        let mma_bar_2 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_2);
+        let mma_bar_3 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_3);
         let accum_full_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_0);
         let accum_full_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_1);
         let accum_empty_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_EMPTY_0);
@@ -158,8 +171,12 @@ pub mod kernels {
 
         let tma_bar_0 = unsafe { tma_bar_0.init(1) };
         let tma_bar_1 = unsafe { tma_bar_1.init(1) };
+        let tma_bar_2 = unsafe { tma_bar_2.init(1) };
+        let tma_bar_3 = unsafe { tma_bar_3.init(1) };
         let mma_bar_0 = unsafe { mma_bar_0.init(1) };
         let mma_bar_1 = unsafe { mma_bar_1.init(1) };
+        let mma_bar_2 = unsafe { mma_bar_2.init(1) };
+        let mma_bar_3 = unsafe { mma_bar_3.init(1) };
         let accum_full_0 = unsafe { accum_full_0.init(1) };
         let accum_full_1 = unsafe { accum_full_1.init(1) };
         let accum_empty_0 = unsafe { accum_empty_0.init(128) }; // number of epilogue threads
@@ -183,6 +200,8 @@ pub mod kernels {
         if thread0 {
             mma_bar_0.arrive();
             mma_bar_1.arrive();
+            mma_bar_2.arrive();
+            mma_bar_3.arrive();
         }
         sync_threads();
 
@@ -217,8 +236,8 @@ pub mod kernels {
 
             let mut k_idx = 0u32;
             while k_idx < k_iters {
-                let phase = global_k & 1;
-                let parity = (global_k >> 1) & 1;
+                let phase = global_k % STAGES;
+                let parity = (global_k / STAGES) & 1;
 
                 let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
                     0 => (
@@ -227,11 +246,23 @@ pub mod kernels {
                         &mma_bar_0,
                         &tma_bar_0,
                     ),
-                    _ => (
+                    1 => (
                         &raw mut SMEM_A1 as *mut u8,
                         &raw mut SMEM_B1 as *mut u8,
                         &mma_bar_1,
                         &tma_bar_1,
+                    ),
+                    2 => (
+                        &raw mut SMEM_A2 as *mut u8,
+                        &raw mut SMEM_B2 as *mut u8,
+                        &mma_bar_2,
+                        &tma_bar_2,
+                    ),
+                    _ => (
+                        &raw mut SMEM_A3 as *mut u8,
+                        &raw mut SMEM_B3 as *mut u8,
+                        &mma_bar_3,
+                        &tma_bar_3,
                     ),
                 };
 
@@ -324,8 +355,8 @@ pub mod kernels {
 
                     let mut k_idx = 0u32;
                     while k_idx < k_iters {
-                        let phase = global_k & 1;
-                        let parity = (global_k >> 1) & 1;
+                        let phase = global_k % STAGES;
+                        let parity = (global_k / STAGES) & 1;
 
                         let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
                             0 => (
@@ -334,11 +365,23 @@ pub mod kernels {
                                 &mma_bar_0,
                                 &tma_bar_0,
                             ),
-                            _ => (
+                            1 => (
                                 &raw mut SMEM_A1 as *mut u8,
                                 &raw mut SMEM_B1 as *mut u8,
                                 &mma_bar_1,
                                 &tma_bar_1,
+                            ),
+                            2 => (
+                                &raw mut SMEM_A2 as *mut u8,
+                                &raw mut SMEM_B2 as *mut u8,
+                                &mma_bar_2,
+                                &tma_bar_2,
+                            ),
+                            _ => (
+                                &raw mut SMEM_A3 as *mut u8,
+                                &raw mut SMEM_B3 as *mut u8,
+                                &mma_bar_3,
+                                &tma_bar_3,
                             ),
                         };
 
@@ -403,8 +446,8 @@ pub mod kernels {
 
                 let mut k_idx = 0u32;
                 while k_idx < k_iters {
-                    let phase = global_k & 1;
-                    let parity = (global_k >> 1) & 1;
+                    let phase = global_k % STAGES;
+                    let parity = (global_k / STAGES) & 1;
 
                     let (smem_a, smem_b, mma_bar, tma_bar) = match phase {
                         0 => (
@@ -413,11 +456,23 @@ pub mod kernels {
                             &mma_bar_0,
                             &tma_bar_0,
                         ),
-                        _ => (
+                        1 => (
                             &raw mut SMEM_A1 as u64,
                             &raw mut SMEM_B1 as u64,
                             &mma_bar_1,
                             &tma_bar_1,
+                        ),
+                        2 => (
+                            &raw mut SMEM_A2 as u64,
+                            &raw mut SMEM_B2 as u64,
+                            &mma_bar_2,
+                            &tma_bar_2,
+                        ),
+                        _ => (
+                            &raw mut SMEM_A3 as u64,
+                            &raw mut SMEM_B3 as u64,
+                            &mma_bar_3,
+                            &tma_bar_3,
                         ),
                     };
 
@@ -525,6 +580,7 @@ pub mod kernels {
                 while !full_bar.try_wait_parity(full_parity) {}
 
                 let mut tmem_row_offset = 0u32;
+                #[unroll]
                 while tmem_row_offset < 32 {
                     let tmem_row = warp_row as u32 + tmem_row_offset;
 
@@ -591,6 +647,7 @@ pub mod kernels {
 
                 // interate over the SMEM out linearly for coalesced loads
                 let mut local_idx = lane_id as usize;
+                #[unroll]
                 while local_idx < PER_WARP_BOUNDS {
                     let local_row = local_idx / TILE_WIDTH;
                     let local_col = local_idx % TILE_WIDTH;
@@ -619,8 +676,12 @@ pub mod kernels {
             // dealloc barriers
             let _tma_bar_0 = tma_bar_0.inval();
             let _tma_bar_1 = tma_bar_1.inval();
+            let _tma_bar_2 = tma_bar_2.inval();
+            let _tma_bar_3 = tma_bar_3.inval();
             let _mma_bar_0 = mma_bar_0.inval();
             let _mma_bar_1 = mma_bar_1.inval();
+            let _mma_bar_2 = mma_bar_2.inval();
+            let _mma_bar_3 = mma_bar_3.inval();
             let _accum_full_0 = accum_full_0.inval();
             let _accum_full_1 = accum_full_1.inval();
             let _accum_empty_0 = accum_empty_0.inval();
@@ -1861,7 +1922,7 @@ pub fn matmul(
 
 // BENCHMARKS:
 // -- GPU (B200), 8192×8192×8192, bench_all (same shape/data, fair ladder):
-//
+// WORK STEALING (WAVES=4)      1.5600 ms   704.8 TFLOP/s
 // WORK STEALING (WAVES=2)      2.2133 ms   496.8 TFLOPs
 // TCGEN05 v3 WARP SPECIALIZED  2.1693 ms   506.8 TFLOPs    (36% of ~1400 bf16 SoL)
 // TCGEN05 v2 PIPELINE          3.7748 ms   291.3 TFLOPs

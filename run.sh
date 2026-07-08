@@ -7,6 +7,7 @@
 #   ./run.sh vecsum thrust   # Thrust/CUB reduce baseline (kernels/<k>/baselines)
 #   GPU=A100 ./run.sh vecadd bench   # pick a GPU
 #   SANITIZE=synccheck ./run.sh gemm # compute-sanitizer (memcheck/racecheck/synccheck/initcheck)
+#   BASELINE=gemm_baseline ./run.sh gemm    # CUDA C++ baseline (kernels/<k>/baselines/<name>.cu)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -21,5 +22,6 @@ elif [[ -n "$bin" ]]; then
 fi
 [[ -n "${GPU:-}" ]] && args+=(--gpu "$GPU")
 [[ -n "${SANITIZE:-}" ]] && args+=(--sanitize "$SANITIZE")
+[[ -n "${BASELINE:-}" ]] && args+=(--baseline "$BASELINE")
 
 exec modal run modal_app.py "${args[@]}"

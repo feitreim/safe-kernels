@@ -23,7 +23,7 @@ CUDA_OXIDE_REF = "v0.2.1"
 RUST_TOOLCHAIN = "nightly-2026-04-03"
 GIT_REPO = "https://github.com/NVlabs/cuda-oxide.git"
 
-DEFAULT_GPU = "L4"  # cheap, modern (Ada / sm_89), supported by CUDA 13
+DEFAULT_GPU = "B200"  # kernels use tcgen05 features anyway.
 PROJECT_DIR = "/root/project"  # local kernels mounted here at run time
 
 # Mirror of the dependency block in kernels/vecadd/Cargo.toml. Used only to warm
@@ -141,17 +141,26 @@ def run_kernel(kernel: str, bin: str | None = None) -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
-def run_thrust(kernel: str = "vecsum") -> None:
+def run_baseline(kernel: str, name: str) -> None:
+    """Compile and run a CUDA C++ baseline from kernels/<kernel>/baselines/.
+
+    Default flags are `-O3 -arch=native` (compile for the card we run on); a
+    baseline needing more declares it in a leading `// nvcc-flags: ...` comment
+    (e.g. `-arch=sm_100a -lcuda` for tcgen05 + the tensor-map driver API).
+    """
     import os
 
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
-    src = f"{PROJECT_DIR}/kernels/{kernel}/baselines/reduce_baseline.cu"
+    src = f"{PROJECT_DIR}/kernels/{kernel}/baselines/{name}.cu"
     if not os.path.isfile(src):
-        raise SystemExit(f"no reduce baseline at {src}")
-    # `-arch=native` targets the GPU this function is running on, so the baseline
-    # is always compiled for the same card the vecsum benchmark ran on.
-    _run(["nvcc", "-O3", "-arch=native", "-o", "/tmp/reduce_baseline", src], cwd="/")
-    _run(["/tmp/reduce_baseline"], cwd="/")
+        raise SystemExit(f"no baseline at kernels/{kernel}/baselines/{name}.cu")
+    flags = ["-arch=native"]
+    with open(src) as f:
+        first = f.readline().strip()
+    if first.startswith("// nvcc-flags:"):
+        flags = first.removeprefix("// nvcc-flags:").split()
+    _run(["nvcc", "-O3", *flags, "-o", f"/tmp/{name}", src], cwd="/")
+    _run([f"/tmp/{name}"], cwd="/")
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
@@ -231,6 +240,43 @@ def dump_ptx(kernel: str) -> str:
     raise SystemExit(f"no .ptx produced under {proj}")
 
 
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def compare_ptx(kernel: str, baseline: str) -> dict:
+    """Build the cuda-oxide PTX and the nvcc PTX for a baseline, plus
+    `ptxas -v` register/spill stats for both, for offline comparison."""
+    import os
+
+    proj = f"{PROJECT_DIR}/kernels/{kernel}"
+    _run(["cargo", "oxide", "build", kernel], cwd=proj)
+    rust_ptx = ""
+    for root, _, files in os.walk(proj):
+        for f in sorted(files):
+            if f.endswith(".ptx"):
+                rust_ptx = Path(root, f).read_text()
+    if not rust_ptx:
+        raise SystemExit(f"no .ptx produced under {proj}")
+
+    src = Path(proj, "baselines", f"{baseline}.cu")
+    flags = ["-arch=native"]
+    first = src.read_text().splitlines()[0]
+    if first.startswith("// nvcc-flags:"):
+        # -ptx stops before linking, so linker flags like -lcuda don't apply
+        flags = [f for f in first.removeprefix("// nvcc-flags:").split() if f != "-lcuda"]
+    _run(["nvcc", "-O3", *flags, "-ptx", str(src), "-o", "/tmp/baseline.ptx"], cwd="/")
+    cpp_ptx = Path("/tmp/baseline.ptx").read_text()
+
+    Path("/tmp/rust.ptx").write_text(rust_ptx)
+    stats = {}
+    for name, path in (("rust", "/tmp/rust.ptx"), ("cpp", "/tmp/baseline.ptx")):
+        r = subprocess.run(
+            ["ptxas", "-v", "--gpu-name", "sm_100a", path, "-o", "/dev/null"],
+            capture_output=True, text=True,
+        )
+        stats[name] = r.stderr
+        print(f"--- ptxas -v ({name}) ---\n{r.stderr}", flush=True)
+    return {"rust_ptx": rust_ptx, "cpp_ptx": cpp_ptx, "stats": stats}
+
+
 @app.function(gpu=DEFAULT_GPU, timeout=600)
 def doctor() -> None:
     _run(["nvidia-smi"], cwd="/")
@@ -246,14 +292,25 @@ def main(
     ptx: bool = False,
     sweep: str = "",
     sanitize: str = "",
+    baseline: str = "",
+    ptxcmp: str = "",
 ) -> None:
+    if ptxcmp:
+        fn = compare_ptx.with_options(gpu=gpu) if gpu else compare_ptx
+        out = fn.remote(kernel, ptxcmp)
+        rust_path = Path(f"/tmp/{kernel}_rust.ptx")
+        cpp_path = Path(f"/tmp/{kernel}_cpp.ptx")
+        rust_path.write_text(out["rust_ptx"])
+        cpp_path.write_text(out["cpp_ptx"])
+        print(f"wrote {rust_path} and {cpp_path}")
+        return
     if sanitize:
         fn = run_sanitizer.with_options(gpu=gpu) if gpu else run_sanitizer
         fn.remote(kernel, bin or None, sanitize)
         return
-    if thrust:
-        fn = run_thrust.with_options(gpu=gpu) if gpu else run_thrust
-        fn.remote(kernel)
+    if thrust or baseline:
+        fn = run_baseline.with_options(gpu=gpu) if gpu else run_baseline
+        fn.remote(kernel, baseline or "reduce_baseline")
         return
     if ptx:
         fn = dump_ptx.with_options(gpu=gpu) if gpu else dump_ptx
