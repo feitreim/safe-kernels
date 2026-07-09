@@ -12,8 +12,8 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use gemm::kernels::{self, K, M, N};
 use gemm::{Gemm, from_packed_bf16, to_bf16, transpose};
 
-const WARMUP: usize = 5;
-const ITERS: usize = 50;
+const WARMUP: usize = 500;
+const ITERS: usize = 1000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;

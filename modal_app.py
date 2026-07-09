@@ -114,6 +114,31 @@ image = (
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide setup",
         "cd /opt/warmup && LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs cargo oxide build warmup",
     )
+    # Build the codegen backend from the local cuda-oxide fork and point
+    # cargo-oxide at it via CUDA_OXIDE_BACKEND (its highest-priority override).
+    # The layer is copied at image build, so fork edits trigger an image
+    # rebuild (~minutes) rather than a per-run build. Device/host library
+    # crates still come from the upstream git pin; only the compiler changes.
+    .add_local_dir(
+        str(Path(__file__).parent.parent / "cuda-oxide"),
+        "/opt/cuda-oxide-fork",
+        copy=True,
+        ignore=["**/target", ".git", "cuda-oxide-book", "**/*.ptx", "**/*.ll"],
+    )
+    .run_commands(
+        "cd /opt/cuda-oxide-fork/crates/rustc-codegen-cuda && "
+        'SYSROOT="$(rustc --print sysroot)" && '
+        'LIBRARY_PATH="$SYSROOT/lib" LD_LIBRARY_PATH="$SYSROOT/lib" cargo build --lib && '
+        "test -f target/debug/librustc_codegen_cuda.so",
+    )
+    .env(
+        {
+            "CUDA_OXIDE_BACKEND": (
+                "/opt/cuda-oxide-fork/crates/rustc-codegen-cuda/target/debug/"
+                "librustc_codegen_cuda.so"
+            )
+        }
+    )
     # Live mount of local kernels (re-read each run; edits need no image rebuild).
     .add_local_dir(str(Path(__file__).parent / "kernels"), f"{PROJECT_DIR}/kernels")
 )
@@ -127,9 +152,13 @@ def _run(cmd: list[str], cwd: str) -> None:
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
-def run_kernel(kernel: str, bin: str | None = None) -> None:
+def run_kernel(kernel: str, bin: str | None = None, stock: bool = False) -> None:
     import os
 
+    # --stock: drop the fork-backend override so cargo-oxide falls back to the
+    # upstream backend it built during `cargo oxide setup`.
+    if stock:
+        os.environ.pop("CUDA_OXIDE_BACKEND", None)
     _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
     proj = f"{PROJECT_DIR}/kernels/{kernel}"
     if not os.path.isdir(proj):
@@ -138,6 +167,33 @@ def run_kernel(kernel: str, bin: str | None = None) -> None:
     if bin:
         cmd += ["--bin", bin]
     _run(cmd, cwd=proj)
+
+
+@app.function(gpu=DEFAULT_GPU, timeout=3600)
+def run_ab(kernel: str, bin: str | None = None) -> None:
+    """Run a kernel with the stock upstream backend and the fork backend
+    back-to-back in ONE container, so both runs share a GPU and its clocks.
+
+    A full `cargo clean` between runs forces a rebuild: cargo does not
+    fingerprint CUDA_OXIDE_BACKEND, so without it the second run would reuse
+    the first run's PTX.
+    """
+    import os
+
+    _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv"], cwd="/")
+    proj = f"{PROJECT_DIR}/kernels/{kernel}"
+    if not os.path.isdir(proj):
+        raise SystemExit(f"no kernel project at kernels/{kernel}")
+    fork_backend = os.environ.pop("CUDA_OXIDE_BACKEND")
+    cmd = ["cargo", "oxide", "run", kernel]
+    if bin:
+        cmd += ["--bin", bin]
+    for label, backend in (("stock upstream", None), ("fork", fork_backend)):
+        print(f"=== backend: {label} ===", flush=True)
+        if backend:
+            os.environ["CUDA_OXIDE_BACKEND"] = backend
+        _run(["cargo", "clean"], cwd=proj)
+        _run(cmd, cwd=proj)
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=600)
@@ -294,7 +350,13 @@ def main(
     sanitize: str = "",
     baseline: str = "",
     ptxcmp: str = "",
+    stock: bool = False,
+    ab: bool = False,
 ) -> None:
+    if ab:
+        fn = run_ab.with_options(gpu=gpu) if gpu else run_ab
+        fn.remote(kernel, bin or None)
+        return
     if ptxcmp:
         fn = compare_ptx.with_options(gpu=gpu) if gpu else compare_ptx
         out = fn.remote(kernel, ptxcmp)
@@ -321,4 +383,4 @@ def main(
         fn.remote(kernel, sweep)
         return
     fn = run_kernel.with_options(gpu=gpu) if gpu else run_kernel
-    fn.remote(kernel, bin or None)
+    fn.remote(kernel, bin or None, stock)

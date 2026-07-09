@@ -1,0 +1,20 @@
+[package]
+name = "barrier_bench"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone crate: not part of any parent workspace.
+[workspace]
+
+# Untagged like gemm: tracks the default branch, pinned by Cargo.lock.
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+bench-util = { path = "../bench-util" }
+# Host-side bf16 (kernel input precision); cuda-core impls DeviceCopy for it.
+half = "2"
+
+[profile.release]
+debug = false
+lto = true
