@@ -117,14 +117,8 @@ pub mod kernels {
         // We'll also need an output SMEM now, BM x BN, these are bf16 packed into u32
 
         // TMA/MMA double buffered
-        static mut TMA_BAR_0: Barrier = Barrier::UNINIT;
-        static mut TMA_BAR_1: Barrier = Barrier::UNINIT;
-        static mut TMA_BAR_2: Barrier = Barrier::UNINIT;
-        static mut TMA_BAR_3: Barrier = Barrier::UNINIT;
-        static mut MMA_BAR_0: Barrier = Barrier::UNINIT;
-        static mut MMA_BAR_1: Barrier = Barrier::UNINIT;
-        static mut MMA_BAR_2: Barrier = Barrier::UNINIT;
-        static mut MMA_BAR_3: Barrier = Barrier::UNINIT;
+        static mut TMA_BARS: [Barrier; 4] = [Barrier::UNINIT,Barrier::UNINIT,Barrier::UNINIT,Barrier::UNINIT];
+        static mut MMA_BARS: [Barrier; 4] = [Barrier::UNINIT,Barrier::UNINIT,Barrier::UNINIT,Barrier::UNINIT];
 
         // TMEM accumulator pipelining
         static mut ACCUM_FULL_0: Barrier = Barrier::UNINIT;
@@ -154,14 +148,12 @@ pub mod kernels {
         let thread0 = tid == 0;
 
         // --- Stage 0: Initialize Barriers and TMEM ---
-        let tma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_0);
-        let tma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_1);
-        let tma_bar_2 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_2);
-        let tma_bar_3 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TMA_BAR_3);
-        let mma_bar_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_0);
-        let mma_bar_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_1);
-        let mma_bar_2 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_2);
-        let mma_bar_3 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut MMA_BAR_3);
+        let tma_bars = unsafe {
+            TMA_BARS.map(|bar| ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut bar))
+        };
+        let mma_bars = unsafe {
+            MMA_BARS.map(|bar| ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut bar))
+        };
         let accum_full_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_0);
         let accum_full_1 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_FULL_1);
         let accum_empty_0 = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut ACCUM_EMPTY_0);
@@ -169,14 +161,9 @@ pub mod kernels {
         let tile_bar = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut TILE_READY);
         let clc_bar = ManagedBarrier::<Uninit, Barrier>::from_static(&raw mut CLC_BAR);
 
-        let tma_bar_0 = unsafe { tma_bar_0.init(1) };
-        let tma_bar_1 = unsafe { tma_bar_1.init(1) };
-        let tma_bar_2 = unsafe { tma_bar_2.init(1) };
-        let tma_bar_3 = unsafe { tma_bar_3.init(1) };
-        let mma_bar_0 = unsafe { mma_bar_0.init(1) };
-        let mma_bar_1 = unsafe { mma_bar_1.init(1) };
-        let mma_bar_2 = unsafe { mma_bar_2.init(1) };
-        let mma_bar_3 = unsafe { mma_bar_3.init(1) };
+        let tma_bars = tma_bars.map(|bar| unsafe {bar.init(1)});
+        let mma_bars = mma_bars.map(|bar| unsafe {bar.init(1)});
+
         let accum_full_0 = unsafe { accum_full_0.init(1) };
         let accum_full_1 = unsafe { accum_full_1.init(1) };
         let accum_empty_0 = unsafe { accum_empty_0.init(128) }; // number of epilogue threads

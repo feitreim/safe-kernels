@@ -282,9 +282,11 @@ def run_sanitizer(kernel: str, bin: str | None = None, tool: str = "memcheck") -
 
 
 @app.function(gpu=DEFAULT_GPU, timeout=3600)
-def dump_ptx(kernel: str) -> str:
+def dump_ptx(kernel: str, stock: bool = False) -> str:
     import os
 
+    if stock:
+        os.environ.pop("CUDA_OXIDE_BACKEND", None)
     proj = f"{PROJECT_DIR}/kernels/{kernel}"
     if not os.path.isdir(proj):
         raise SystemExit(f"no kernel project at kernels/{kernel}")
@@ -376,7 +378,7 @@ def main(
         return
     if ptx:
         fn = dump_ptx.with_options(gpu=gpu) if gpu else dump_ptx
-        print(fn.remote(kernel))
+        print(fn.remote(kernel, stock))
         return
     if sweep:
         fn = run_sweep.with_options(gpu=gpu) if gpu else run_sweep
