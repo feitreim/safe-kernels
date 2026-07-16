@@ -1,10 +1,15 @@
+# Blog Post
+
+check out my (in-progress right now) blog post @ https://feitreim.com/posts/safe-and-fast-cuda-in-rust.html
+to hear a bit more about my specific adventures with cuda-oxide.
+
 # cuda-oxide kernel dev environment
 
 Write GPU kernels in pure Rust with [cuda-oxide](https://github.com/NVlabs/cuda-oxide),
 build/run/benchmark them on a Modal GPU.
 
 [cuda-oxide](https://github.com/NVlabs/cuda-oxide) is a `rustc` codegen backend
-(Rust MIR → LLVM → PTX). You write host *and* device code in one Rust file:
+(Rust MIR → LLVM → PTX). You write host _and_ device code in one Rust file:
 `#[kernel]` functions become PTX, everything else compiles natively. No `.cu`
 files, no `nvcc`.
 
